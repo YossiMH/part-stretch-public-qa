@@ -47,8 +47,9 @@ SOURCE_PATHS = ("codemagic.yaml", "qa/test-plan.md", "qa/test_stl.py", "qa/test_
 ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
 
 # Session tuples contain loopback origin, session ID, local operation journal and
-# monotonic body deadline. No independently writable ready/connected flag exists.
-Session = tuple[str, str, pathlib.Path, float]
+# monotonic body deadline and main-owned diagnostic cache. The cache records only
+# observations and test progress; it never authorizes or retries browser effects.
+Session = tuple[str, str, pathlib.Path, float, dict[str, object]]
 Checks = list[dict[str, object]]
 Images = list[dict[str, object]]
 
@@ -139,6 +140,8 @@ def _request(origin: str, route: str, method: str, payload: object, deadline: fl
 def _command(session: Session, method: str, route: str, payload: object, name: str,
              operation_id: str = "") -> object:
     """Send one command on the owned session; _request owns the operation receipt."""
+    session[4]["command"] = {"name": name, "method": method,
+                             "route": re.sub(r"/element/[^/]+", "/element/{element}", route)}
     return _request(session[0], "/session/" + urllib.parse.quote(session[1], safe="") + route,
                     method, payload, session[3], session[2], name, operation_id)
 
@@ -242,7 +245,7 @@ def _supply_product_file(session: Session, path: pathlib.Path) -> dict[str, obje
 
 def _snapshot(session: Session) -> dict[str, object]:
     """Read selected public controls only; never dump a page, app object or storage."""
-    return _object(_read(session, """
+    observed = _object(_read(session, """
 const text=id=>document.getElementById(id)?.textContent.trim()||'';
 const value=id=>document.getElementById(id)?.value??'';
 const visible=id=>{const e=document.getElementById(id);return e&&e.getClientRects().length>0;};
@@ -253,8 +256,14 @@ return {release:document.querySelector('meta[name="part-stretch-release"]')?.con
  axis:document.querySelector('#precision-controls [data-axis][aria-pressed="true"]')?.getAttribute('data-axis')||'',
  ui_error:visible('error-box')?text('error'):'',status:text('status'),view_note:text('view-note'),
  editor:visible('editor')?'displayed':'absent',anchor_picker:visible('anchor-picker')?'displayed':'absent',
- focused:document.activeElement?.id||'',viewport:[innerWidth,innerHeight]};
+ focused:document.activeElement?.id||'',viewport:[innerWidth,innerHeight],
+ document_ready:document.readyState,selected_file_count:document.getElementById('file')?.files?.length??null,
+ load_error:visible('load-error')?text('load-error').slice(0,512):'',
+ load_progress:visible('load-progress')?'displayed':'absent'};
 """), "NATIVE_DOM_OBSERVATION")
+    session[4]["selected_dom"] = {key: value[:512] if isinstance(value, str) else value
+                                   for key, value in observed.items()}
+    return observed
 
 
 def _dimensions(text: object) -> Point:
@@ -467,6 +476,8 @@ def _integration(session: Session, output: pathlib.Path, run_id: str, origin: st
           lambda value: value == 200, "NATIVE_STATIC_SERVER_STARTUP_DEADLINE")
     _command(session, "POST", "/url", {"url": origin + "/"}, "open-file-control-page")
     page_observation = _snapshot(session)
+    if session[4].get("selected_dom") != page_observation:
+        raise ValueError("NATIVE_OBSERVATION_CACHE_MISMATCH")
     if page_observation.get("ui_error") != "" or page_observation.get("editor") != "absent":
         raise ValueError("NATIVE_FILE_CONTROL_OBSERVATION_MISMATCH")
     checks.append({"name": "page-observation-protocol-boundary", "dom": page_observation})
@@ -488,12 +499,16 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
     result_size: Point = (20.0, 11.0, 7.0) if phase == "guest" else (24.0, 10.0, 6.0)
     end_mm, delta_mm = (12.0, 3.0) if phase == "guest" else (15.0, 4.0)
     fixture, summary = _new_fixture(output, run_id, phase, size)
+    session[4]["stage"] = "first-public-navigation"
     _command(session, "POST", "/url", {"url": PUBLIC_URL}, "open-public-guest")
+    session[4]["stage"] = "first-product-file-selection"
     supplied = _supply_product_file(session, fixture)
+    session[4]["stage"] = "first-model-dimensions-wait"
     imported = _model(session, size)
     if imported.get("filename") != fixture.name or supplied.get("sha256") != summary["sha256"]:
         raise ValueError("NATIVE_IMPORTED_FILE_IDENTITY_MISMATCH")
     checks.append({"name": "normal-import", "supplied_file": supplied, "stl": summary, "dom": imported, "webgl": _webgl(session)})
+    session[4]["stage"] = "first-import-verified"
     _capture(session, output, "imported-model", images)
     original_operation = _edit(session, end_mm, delta_mm)
     edited = _model(session, result_size)
@@ -649,7 +664,8 @@ def _driver_status(origin: str, deadline: float, journal: pathlib.Path, process:
         return None
 
 
-def _session(origin: str, deadline: float, journal: pathlib.Path, process: subprocess.Popen[bytes]) -> tuple[Session, object]:
+def _session(origin: str, deadline: float, journal: pathlib.Path, process: subprocess.Popen[bytes],
+             observation_cache: dict[str, object]) -> tuple[Session, object]:
     """Create exactly one real Safari session after bounded driver readiness."""
     startup_deadline = min(deadline, time.monotonic() + 8.0)
     _poll(startup_deadline, lambda: _driver_status(origin, startup_deadline, journal, process),
@@ -657,7 +673,7 @@ def _session(origin: str, deadline: float, journal: pathlib.Path, process: subpr
     envelope = _object(_request(origin, "/session", "POST", {"capabilities": {"alwaysMatch": {"browserName": "safari"}}},
                                 deadline, journal, "create-native-session"), "NATIVE_SESSION_ENVELOPE")
     session_id = _string(envelope.get("sessionId"), "NATIVE_SESSION_ID_MISSING")
-    session: Session = origin, session_id, journal, deadline
+    session: Session = origin, session_id, journal, deadline, observation_cache
     return session, envelope.get("capabilities")
 
 
@@ -764,6 +780,9 @@ def main() -> int:
     session: Session | None = None
     original_failure: dict[str, object] = {}
     versions: dict[str, object] = {}
+    # Retain the last bounded DOM read and command location when the body deadline
+    # leaves no time for another browser call. This is not application state.
+    observation_cache: dict[str, object] = {"stage": "native-session-setup"}
     image_lines: list[str] = []
     image_bytes = 0
     started_utc, started = _utc(), time.monotonic()
@@ -775,7 +794,7 @@ def main() -> int:
             _versions(deadline, versions)
             driver_port = _free_port()
             driver = _launch(("/usr/bin/safaridriver", "--port", str(driver_port)), "safaridriver", resources, journal)
-            session, capabilities = _session("http://127.0.0.1:" + str(driver_port), deadline, journal, driver)
+            session, capabilities = _session("http://127.0.0.1:" + str(driver_port), deadline, journal, driver, observation_cache)
             identity = admit_native_session(platform.system(), capabilities)
             versions["session"] = identity
             if identity["browser_version"] != versions["safari_short_version"]:
@@ -815,6 +834,7 @@ def main() -> int:
         "started_utc": started_utc, "ended_utc": _utc(), "elapsed_seconds": time.monotonic() - started,
         "checks": checks, "images": images, "image_output_bytes": image_bytes,
         "original_failure": original_failure, "cleanup_errors": cleanup_errors,
+        "observation_cache": observation_cache,
         "limits": ["desktop-not-physical-ios", "actual-image-view-pending", "private-services-not-exercised",
                    "executor-must-retain-provider-identities-and-pre-post-balance"]}
     _json_file(output / "result.json", result)
