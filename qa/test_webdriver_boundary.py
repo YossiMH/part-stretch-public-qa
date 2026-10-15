@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from qa.webdriver import admit_native_session, parse_webdriver_response, write_next_action
+from qa.webdriver import (admit_native_session, latest_stable_safari_version,
+                          parse_webdriver_response, require_current_safari_version, write_next_action)
 
 
 def _reject(code: str, operation: Callable[[], object]) -> None:
@@ -68,6 +69,22 @@ def test_native_admission_requires_actual_host_and_session_fields() -> None:
         _reject("NATIVE_SAFARI_REQUIRED", lambda: admit_native_session("Darwin", malformed))
 
 
+def test_current_safari_release_includes_whole_major_labels() -> None:
+    """The current whole-major release cannot be replaced by an older decimal row."""
+    observed = latest_stable_safari_version("Safari 26.6\nSafari 27")
+    assert observed == "27", observed
+    assert latest_stable_safari_version("Safari 26.6\nSafari 27.1") == "27.1"
+
+
+def test_current_safari_version_normalizes_only_equivalent_trailing_zeros() -> None:
+    """27 and 27.0 match; genuinely older/newer installed versions still fail."""
+    assert require_current_safari_version("27.0", "27") is None
+    assert require_current_safari_version("27", "27.0") is None
+    for installed in ("26.6", "27.1"):
+        _reject("NATIVE_SAFARI_NOT_CURRENT_STABLE:" + installed + ":27",
+                lambda: require_current_safari_version(installed, "27"))
+
+
 def test_only_known_unexecuted_writes_can_be_dispatched() -> None:
     """The decision returns an instruction and never invents completion or a retry."""
     assert write_next_action("operation-1", "", "not-dispatched") == "dispatch-once"
@@ -96,6 +113,8 @@ def main() -> int:
              test_json_and_envelope_errors_cannot_become_success,
              test_remote_error_code_is_retained_without_raw_message,
              test_native_admission_requires_actual_host_and_session_fields,
+             test_current_safari_release_includes_whole_major_labels,
+             test_current_safari_version_normalizes_only_equivalent_trailing_zeros,
              test_only_known_unexecuted_writes_can_be_dispatched,
              test_foreign_or_missing_receipts_cannot_authorize_replay)
     failures: list[str] = []

@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Native file controls</title>
+<style>
+  body { max-width: 42rem; margin: 3rem auto; padding: 0 1rem; font: 18px system-ui; }
+  label, a { display: block; margin: 1.5rem 0; }
+  input { font: inherit; max-width: 100%; }
+</style>
+<h1>Native file controls</h1>
+<p>Select the generated STL with this ordinary file input. The runner reads the
+selected File through standard read-only browser APIs.</p>
+<label>Generated STL <input id="fixture" type="file" accept=".stl"></label>
+<a id="fixture-download" href="fixture.stl" download>Download the served STL</a>
+<p>The server supplies the actual fixture bytes. This page does not create a File,
+replace a selection, handle a synthetic download, or imitate the product.</p>
+</html>
