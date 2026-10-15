@@ -1,0 +1,218 @@
+workflows:
+  native-safari-preflight:
+    name: Native Safari public-page preflight
+    instance_type: mac_mini_m2
+    max_build_duration: 5
+    environment:
+      xcode: "27.0"
+    # With no triggering events, this workflow can only be started manually.
+    scripts:
+      - name: Read the Mac and exercise native Safari
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          from __future__ import annotations
+
+          import base64
+          import json
+          import platform
+          import plistlib
+          import signal
+          import socket
+          import subprocess
+          import time
+          from pathlib import Path
+
+
+          def expire(_signal: int, _frame: object) -> None:
+              """Interrupt this disposable preflight; cleanup gets its own short deadlines."""
+              raise TimeoutError("PREFLIGHT_50_SECOND_DEADLINE")
+
+
+          def command(arguments: list[str], seconds: int = 5) -> str:
+              """Run only the named built-in command, with captured output and a hard deadline."""
+              completed = subprocess.run(arguments, capture_output=True, text=True, timeout=seconds)
+              if completed.returncode != 0:
+                  raise RuntimeError("BUILT_IN_COMMAND_FAILED:" + Path(arguments[0]).name)
+              return completed.stdout.strip()
+
+
+          def mapping(value: object) -> dict[str, object]:
+              """Reject a malformed WebDriver JSON object without printing its contents."""
+              if not isinstance(value, dict):
+                  raise RuntimeError("WEBDRIVER_OBJECT_REQUIRED")
+              return value
+
+
+          def request(base: str, method: str, route: str, payload: object = None,
+                      seconds: int = 8) -> object:
+              """Call the task-owned loopback driver once; never replay an uncertain write."""
+              arguments = ["/usr/bin/curl", "--silent", "--show-error", "--noproxy", "*",
+                           "--connect-timeout", "1", "--max-time", str(seconds),
+                           "--request", method, base + route]
+              if payload is not None:
+                  arguments += ["--header", "Content-Type: application/json",
+                                "--data-binary", json.dumps(payload)]
+              result: object = json.loads(command(arguments, seconds + 1))
+              response = mapping(result)
+              if "value" not in response:
+                  raise RuntimeError("WEBDRIVER_VALUE_REQUIRED")
+              return response["value"]
+
+
+          def checked(base: str, method: str, route: str, payload: object = None,
+                      seconds: int = 8) -> object:
+              """Propagate the driver's public error code; raw session responses stay private."""
+              value = request(base, method, route, payload, seconds)
+              if isinstance(value, dict) and "error" in value:
+                  raise RuntimeError("WEBDRIVER_ERROR:" + str(value["error"]))
+              return value
+
+
+          def main() -> int:
+              """Own the native process/session and write only selected public observations."""
+              signal.signal(signal.SIGALRM, expire)
+              signal.alarm(50)
+              output = Path("safari-preflight")
+              output.mkdir(exist_ok=True)
+              report: dict[str, object] = {"result": "NOT_COMPLETED",
+                  "target": "https://part-stretch-free.pages.dev/",
+                  "expected_release": "9b0731642df08c879cbea912b6ff7daf3401a164",
+                  "currency": "REQUIRES_RUN_TIME_COMPARISON_WITH_APPLE_CURRENT_STABLE",
+                  "limits": "Native setup/public example only; upload, edit, download, full-file validation, reopen, WebGL identity and iOS remain unverified."}
+              driver: subprocess.Popen[bytes] | None = None
+              session_id = ""
+              base = ""
+              exit_code = 1
+              try:
+                  if platform.system() != "Darwin":
+                      raise RuntimeError("ACTUAL_MACOS_REQUIRED")
+                  report["macos"] = command(["/usr/bin/sw_vers"])
+                  with open("/Applications/Safari.app/Contents/Info.plist", "rb") as safari_file:
+                      safari = plistlib.load(safari_file)
+                  report["safari_bundle_version"] = str(safari["CFBundleShortVersionString"])
+                  report["safari_bundle_build"] = str(safari["CFBundleVersion"])
+                  report["safaridriver_version"] = command(["/usr/bin/safaridriver", "--version"])
+                  with socket.socket() as reservation:
+                      reservation.bind(("127.0.0.1", 0))
+                      port = reservation.getsockname()[1]
+                  base = "http://127.0.0.1:" + str(port)
+                  driver = subprocess.Popen(["/usr/bin/safaridriver", "--port", str(port)],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  startup_deadline = time.monotonic() + 5
+                  while time.monotonic() < startup_deadline:
+                      if driver.poll() is not None:
+                          raise RuntimeError("NATIVE_DRIVER_EXITED_DURING_STARTUP")
+                      try:
+                          checked(base, "GET", "/status", seconds=1)
+                          break
+                      except RuntimeError as error:
+                          if str(error) != "BUILT_IN_COMMAND_FAILED:curl":
+                              raise
+                          time.sleep(0.2)
+                  else:
+                      raise TimeoutError("NATIVE_DRIVER_STARTUP_DEADLINE")
+                  session_request = {"capabilities": {"alwaysMatch": {"browserName": "safari"}}}
+                  session = mapping(request(base, "POST", "/session", session_request))
+                  if session.get("error") == "session not created":
+                      message = str(session.get("message", "")).lower()
+                      if "enable" in message and "automation" in message:
+                          # Apple's --enable is limited to this disposable provider Mac.
+                          # sudo -n fails immediately if unattended authorization is absent.
+                          command(["/usr/bin/sudo", "-n", "/usr/bin/safaridriver", "--enable"], 5)
+                          report["driver_enablement"] = "APPLE_ENABLE_AFTER_CONFIRMED_DISABLED_SESSION"
+                          session = mapping(request(base, "POST", "/session", session_request))
+                  if "error" in session:
+                      raise RuntimeError("WEBDRIVER_SESSION_ERROR:" + str(session["error"]))
+                  identifier = session.get("sessionId")
+                  if not isinstance(identifier, str) or not identifier:
+                      raise RuntimeError("NATIVE_SESSION_ID_REQUIRED")
+                  session_id = identifier
+                  capabilities = mapping(session.get("capabilities"))
+                  browser_name = capabilities.get("browserName")
+                  browser_version = capabilities.get("browserVersion")
+                  if not isinstance(browser_name, str) or browser_name.lower() != "safari":
+                      raise RuntimeError("NATIVE_SAFARI_CAPABILITY_REQUIRED")
+                  if not isinstance(browser_version, str) or not browser_version:
+                      raise RuntimeError("NATIVE_SAFARI_VERSION_REQUIRED")
+                  report["native_session"] = {"browserName": browser_name, "browserVersion": browser_version}
+                  route = "/session/" + session_id
+                  checked(base, "POST", route + "/timeouts", {"pageLoad": 12000, "script": 4000, "implicit": 0})
+                  checked(base, "POST", route + "/url", {"url": report["target"]}, seconds=14)
+                  element = mapping(checked(base, "POST", route + "/element",
+                      {"using": "css selector", "value": "#sample"}))
+                  element_id = element.get("element-6066-11e4-a52e-4f735466cecf")
+                  if not isinstance(element_id, str) or not element_id:
+                      raise RuntimeError("PUBLIC_EXAMPLE_CONTROL_REQUIRED")
+                  checked(base, "POST", route + "/element/" + element_id + "/click", {})
+                  observation_script = """
+                  const canvas = document.querySelector('#view');
+                  const rect = canvas ? canvas.getBoundingClientRect() : null;
+                  return {
+                    release: document.querySelector('meta[name="part-stretch-release"]')?.content || '',
+                    services: document.querySelector('meta[name="part-stretch-services"]')?.content || '',
+                    dimensions: document.querySelector('#dimensions')?.textContent.trim() || '',
+                    target: document.querySelector('#target')?.value || '',
+                    fileInput: document.querySelector('#file')?.type || '',
+                    canvasPixels: canvas ? [canvas.width, canvas.height] : [],
+                    canvasRect: rect ? [rect.width, rect.height] : []
+                  };
+                  """
+                  example_deadline = time.monotonic() + 6
+                  while time.monotonic() < example_deadline:
+                      observation = mapping(checked(base, "POST", route + "/execute/sync",
+                          {"script": observation_script, "args": []}, seconds=5))
+                      if observation.get("target") and observation.get("dimensions"):
+                          break
+                      time.sleep(0.2)
+                  else:
+                      raise TimeoutError("PUBLIC_EXAMPLE_LOAD_DEADLINE")
+                  if observation.get("release") != report["expected_release"] or observation.get("services") != "guest-beta":
+                      raise RuntimeError("EXACT_PUBLIC_GUEST_RELEASE_REQUIRED")
+                  canvas_rect = observation.get("canvasRect")
+                  if not isinstance(canvas_rect, list) or len(canvas_rect) != 2 or min(canvas_rect) <= 0:
+                      raise RuntimeError("VISIBLE_MODEL_CANVAS_REQUIRED")
+                  if observation.get("fileInput") != "file":
+                      raise RuntimeError("ORDINARY_FILE_INPUT_PREREQUISITE_REQUIRED")
+                  report["public_example_after_normal_click"] = observation
+                  screenshot = checked(base, "GET", route + "/screenshot", seconds=5)
+                  if not isinstance(screenshot, str):
+                      raise RuntimeError("NATIVE_SCREENSHOT_REQUIRED")
+                  png = base64.b64decode(screenshot, validate=True)
+                  if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+                      raise RuntimeError("NATIVE_SCREENSHOT_PNG_REQUIRED")
+                  (output / "public-example.png").write_bytes(png)
+                  report["screenshot"] = "public-example.png; visual inspection required; screenshot alone does not establish WebGL"
+                  report["result"] = "NATIVE_SESSION_AND_PUBLIC_EXAMPLE_CONTROL_OBSERVED"
+                  exit_code = 0
+              except Exception as error:
+                  report["result"] = "NATIVE_PREREQUISITE_INCOMPLETE"
+                  report["failure"] = str(error) if isinstance(error, (RuntimeError, TimeoutError)) else type(error).__name__
+              finally:
+                  signal.alarm(0)
+                  if session_id:
+                      try:
+                          checked(base, "DELETE", "/session/" + session_id, seconds=2)
+                          report["session_cleanup"] = "DELETED"
+                      except Exception as error:
+                          report["session_cleanup"] = "INCOMPLETE:" + type(error).__name__
+                          exit_code = 1
+                  if driver is not None:
+                      driver.terminate()
+                      try:
+                          driver.wait(timeout=1)
+                      except subprocess.TimeoutExpired:
+                          driver.kill()
+                          driver.wait(timeout=1)
+                  serialized = json.dumps(report, indent=2) + "\n"
+                  (output / "result.json").write_text(serialized, encoding="utf-8")
+                  print(serialized, end="")
+              return exit_code
+
+
+          raise SystemExit(main())
+          PY
+    artifacts:
+      - safari-preflight/result.json
+      - safari-preflight/public-example.png
