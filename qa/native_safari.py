@@ -188,21 +188,25 @@ def _wait_visible(session: Session, selector: str) -> None:
 def _type(session: Session, selector: str, text: str) -> None:
     """Replace through Mac Command+A, then verify the typed value across normal Tab.
 
-    WebDriver Clear unfocuses the input. Keyboard replacement retains focus through
-    the edit; NULL releases Command before ordinary characters are dispatched.
+    Element Send Keys left the handler-free number unchanged in native integration.
+    Use keyboard Actions with explicit key release; readbacks still require the edit.
     """
     element = _element(session, selector)
     _command(session, "POST", "/element/" + element + "/click", {}, "focus:" + selector)
     _layout(session, (selector,))
-    _command(session, "POST", "/element/" + element + "/value", {"text": "\ue03da\ue000"}, "select-all:" + selector)
+    _command(session, "POST", "/actions", {"actions": [{"type": "key", "id": "native-keyboard", "actions": [
+        {"type": "keyDown", "value": "\ue03d"}, {"type": "keyDown", "value": "a"},
+        {"type": "keyUp", "value": "a"}, {"type": "keyUp", "value": "\ue03d"}]}]}, "select-all:" + selector)
     for character in text:
-        _command(session, "POST", "/element/" + element + "/value", {"text": character}, "type:" + selector)
+        _command(session, "POST", "/actions", {"actions": [{"type": "key", "id": "native-keyboard", "actions": [
+            {"type": "keyDown", "value": character}, {"type": "keyUp", "value": character}]}]}, "type:" + selector)
         if _read(session, "return document.activeElement===document.querySelector(arguments[0]);", (selector,)) is not True:
             raise ValueError("NATIVE_FIELD_LOST_FOCUS:" + selector)
     value_script = "return document.querySelector(arguments[0]).value;"
     if _read(session, value_script, (selector,)) != text:
         raise ValueError("NATIVE_FIELD_VALUE_BEFORE_TAB:" + selector)
-    _command(session, "POST", "/element/" + element + "/value", {"text": "\ue004"}, "tab:" + selector)
+    _command(session, "POST", "/actions", {"actions": [{"type": "key", "id": "native-keyboard", "actions": [
+        {"type": "keyDown", "value": "\ue004"}, {"type": "keyUp", "value": "\ue004"}]}]}, "tab:" + selector)
     if _read(session, value_script, (selector,)) != text:
         raise ValueError("NATIVE_FIELD_VALUE_AFTER_TAB:" + selector)
 
