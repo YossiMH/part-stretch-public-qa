@@ -521,6 +521,12 @@ def _integration(session: Session, output: pathlib.Path, run_id: str, origin: st
     if downloaded_summary["sha256"] != summary["sha256"] or downloaded.read_bytes() != fixture.read_bytes():
         raise ValueError("NATIVE_INTEGRATION_DOWNLOAD_BYTES_MISMATCH")
     checks.append({"name": "ordinary-download-complete-bytes", "filename": downloaded.name, "stl": downloaded_summary})
+    session[4]["stage"] = "handler-free-number-replacement"
+    _type(session, "#start", "5")
+    number_observation = _object(_snapshot(session), "NATIVE_DOM_OBSERVATION")
+    if number_observation.get("focused") != "number-next":
+        raise ValueError("NATIVE_NUMBER_TAB_FOCUS_MISMATCH")
+    checks.append({"name": "handler-free-number-replacement", "dom": number_observation})
     _capture(session, output, "integration-file-controls", images)
 
 
