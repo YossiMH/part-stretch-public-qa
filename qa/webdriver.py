@@ -37,6 +37,17 @@ def parse_webdriver_response(http_status: int, body: bytes) -> object:
     return value
 
 
+def product_startup_ready(observed: object) -> bool:
+    """Admit file supply only after document load and normal UI handler registration.
+
+    This predicate consumes a read-only DOM snapshot; it neither waits nor installs
+    handlers. A missing field cannot stand in for completed application startup.
+    """
+    return (isinstance(observed, dict) and observed.get("document_ready") == "complete"
+            and observed.get("file_change_handler") == "function"
+            and observed.get("browse_click_handler") == "function")
+
+
 def admit_native_session(host_system: str, capabilities: object) -> dict[str, str]:
     """Require Darwin and a real-session Safari identity supplied by the runner.
 

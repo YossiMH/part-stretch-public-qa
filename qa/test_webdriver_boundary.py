@@ -37,6 +37,22 @@ def test_page_error_text_remains_observation_data() -> None:
         "ui_error": "Invalid shrink", "editor": "displayed"}
 
 
+def test_product_startup_requires_complete_document_and_both_handlers() -> None:
+    """The observed preselection state cannot admit a file before handlers exist."""
+    from qa.webdriver import product_startup_ready
+
+    observed = {"document_ready": "interactive", "file_change_handler": "object", "browse_click_handler": "object"}
+    assert product_startup_ready(observed) is False
+    assert product_startup_ready({**observed, "document_ready": "complete"}) is False
+    ready = {"document_ready": "complete", "file_change_handler": "function", "browse_click_handler": "function"}
+    assert product_startup_ready(ready) is True
+    assert product_startup_ready({**ready, "document_ready": "interactive"}) is False
+    for handler in ("file_change_handler", "browse_click_handler"):
+        assert product_startup_ready({**ready, handler: "object"}) is False
+        assert product_startup_ready({key: value for key, value in ready.items() if key != handler}) is False
+    assert product_startup_ready(None) is False
+
+
 def test_json_and_envelope_errors_cannot_become_success() -> None:
     """Malformed bytes, absent values and failed HTTP responses cannot admit a command."""
     for body in (b'not json', b'{"value":null} trailing', b'{"value":"\xff"}',
@@ -119,6 +135,7 @@ def main() -> int:
     """Execute pure cases without a browser or service; every unexpected result fails."""
     tests = (test_response_value_is_preserved_without_coercion,
              test_page_error_text_remains_observation_data,
+             test_product_startup_requires_complete_document_and_both_handlers,
              test_json_and_envelope_errors_cannot_become_success,
              test_remote_error_code_is_retained_without_raw_message,
              test_native_admission_requires_actual_host_and_session_fields,

@@ -32,7 +32,7 @@ from types import FrameType
 
 from qa.stl import Point, make_cuboid_stl, validate_stl
 from qa.webdriver import (admit_native_session, latest_stable_safari_version,
-                          parse_webdriver_response, require_current_safari_version, write_next_action)
+                          parse_webdriver_response, product_startup_ready, require_current_safari_version, write_next_action)
 
 
 # The public guest release is the only product target. Resource limits are policy,
@@ -483,7 +483,8 @@ def _integration(session: Session, output: pathlib.Path, run_id: str, origin: st
         raise ValueError("NATIVE_OBSERVATION_CACHE_MISMATCH")
     if (page_observation.get("file_change_handler") != "undefined"
             or page_observation.get("browse_click_handler") != "undefined"
-            or session[4].get("preselection_dom_cache") != page_observation):
+            or session[4].get("preselection_dom_cache") != page_observation
+            or product_startup_ready(page_observation)):
         raise ValueError("NATIVE_PRESELECTION_OBSERVATION_MISMATCH")
     if page_observation.get("ui_error") != "" or page_observation.get("editor") != "absent":
         raise ValueError("NATIVE_FILE_CONTROL_OBSERVATION_MISMATCH")
@@ -508,9 +509,12 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
     fixture, summary = _new_fixture(output, run_id, phase, size)
     session[4]["stage"] = "first-public-navigation"
     _command(session, "POST", "/url", {"url": PUBLIC_URL}, "open-public-guest")
-    session[4]["stage"] = "first-product-file-selection"
-    _snapshot(session)
+    session[4]["stage"] = "public-startup-wait"
+    startup = _object(_poll(session[3], lambda: _snapshot(session), product_startup_ready,
+                            "NATIVE_PUBLIC_STARTUP_DEADLINE"), "NATIVE_DOM_OBSERVATION")
     session[4]["preselection_dom_cache"] = session[4]["selected_dom"]
+    checks.append({"name": "normal-page-startup-before-file-selection", "dom": startup})
+    session[4]["stage"] = "first-product-file-selection"
     supplied = _supply_product_file(session, fixture)
     session[4]["stage"] = "first-model-dimensions-wait"
     imported = _model(session, size)
