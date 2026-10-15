@@ -381,23 +381,37 @@ def _prepare_download(directory: pathlib.Path, token: str) -> None:
         raise ValueError("NATIVE_DOWNLOAD_IDENTITY_ALREADY_EXISTS")
 
 
-def _edit(session: Session, end_mm: float, delta_mm: float) -> dict[str, object]:
+def _edit(session: Session, size_mm: Point, end_mm: float, delta_mm: float) -> dict[str, object]:
     """Choose the numeric X band and fixed-start anchor through visible controls."""
+    session[4]["stage"] = "edit-choose-region"
     _click(session, "#choose")
+    session[4]["stage"] = "edit-choose-X-direction"
+    _wait_visible(session, '#direction-picker [data-axis="0"]')
+    _click(session, '#direction-picker [data-axis="0"]')
+    session[4]["stage"] = "edit-enter-exact-positions"
     _wait_visible(session, "#choose-exact")
     _click(session, "#choose-exact")
+    session[4]["stage"] = "edit-open-precision-controls"
     _wait_visible(session, "#delta")
     if _read(session, "return document.getElementById('precision-controls').open;") is not True:
         _click(session, "#precision-controls summary")
-    _click(session, '#precision-controls [data-axis="0"]')
+    session[4]["stage"] = "edit-start-boundary"
     _type(session, "#start", "5")
+    session[4]["stage"] = "edit-end-boundary"
     _type(session, "#end", format(end_mm, ".9g"))
+    session[4]["stage"] = "prepare-anchor-nonzero-delta"
+    _type(session, "#delta", format(delta_mm, ".9g"))
+    session[4]["stage"] = "edit-open-anchor-picker"
     _wait_visible(session, "#anchor")
     _click(session, "#anchor")
+    session[4]["stage"] = "edit-fixed-start-anchor"
     _wait_visible(session, '[data-anchor="1"]')
     _click(session, '[data-anchor="1"]')
-    original_operation = _snapshot(session)
+    session[4]["stage"] = "prepare-anchored-zero-delta"
+    _type(session, "#delta", "0")
+    original_operation = _model(session, size_mm)
     _settings(original_operation, end_mm, 0.0)
+    session[4]["stage"] = "edit-requested-delta"
     _type(session, "#delta", format(delta_mm, ".9g"))
     return original_operation
 
@@ -523,7 +537,7 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
     checks.append({"name": "normal-import", "supplied_file": supplied, "stl": summary, "dom": imported, "webgl": _webgl(session)})
     session[4]["stage"] = "first-import-verified"
     _capture(session, output, "imported-model", images)
-    original_operation = _edit(session, end_mm, delta_mm)
+    original_operation = _edit(session, size, end_mm, delta_mm)
     edited = _model(session, result_size)
     _settings(edited, end_mm, delta_mm)
     if edited.get("focused") != "target":
