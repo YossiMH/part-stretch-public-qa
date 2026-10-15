@@ -186,16 +186,25 @@ def _wait_visible(session: Session, selector: str) -> None:
 
 
 def _type(session: Session, selector: str, text: str) -> None:
-    """Type through the real focused field, checking focus after every keystroke."""
+    """Replace through Mac Command+A, then verify the typed value across normal Tab.
+
+    WebDriver Clear unfocuses the input. Keyboard replacement retains focus through
+    the edit; NULL releases Command before ordinary characters are dispatched.
+    """
     element = _element(session, selector)
     _command(session, "POST", "/element/" + element + "/click", {}, "focus:" + selector)
     _layout(session, (selector,))
-    _command(session, "POST", "/element/" + element + "/clear", {}, "clear:" + selector)
+    _command(session, "POST", "/element/" + element + "/value", {"text": "\ue03da\ue000"}, "select-all:" + selector)
     for character in text:
         _command(session, "POST", "/element/" + element + "/value", {"text": character}, "type:" + selector)
         if _read(session, "return document.activeElement===document.querySelector(arguments[0]);", (selector,)) is not True:
             raise ValueError("NATIVE_FIELD_LOST_FOCUS:" + selector)
+    value_script = "return document.querySelector(arguments[0]).value;"
+    if _read(session, value_script, (selector,)) != text:
+        raise ValueError("NATIVE_FIELD_VALUE_BEFORE_TAB:" + selector)
     _command(session, "POST", "/element/" + element + "/value", {"text": "\ue004"}, "tab:" + selector)
+    if _read(session, value_script, (selector,)) != text:
+        raise ValueError("NATIVE_FIELD_VALUE_AFTER_TAB:" + selector)
 
 
 def _select_file(session: Session, selector: str, path: pathlib.Path) -> dict[str, object]:

@@ -59,6 +59,8 @@ Run only after the integration result passes and is retained. Require actual loa
 
 Observe actual model images and WebGL separately. Read an existing primary canvas context/version only after successful normal model adoption establishes the app already owns its context. Never create a replacement/probe context or patch page functions. Require actual WebGL2 identity/version and visible model rendering; Canvas2D, a canvas rectangle, Safari version or an unviewed PNG cannot pass. Capture native images after import/edit/reopen and the exercised view action; each phase must record what was actually captured/viewed and what remains unavailable.
 
+Numeric entry uses ordinary Mac Command+A through WebDriver Element Send Keys (`U+E03D`, `a`, `U+E000`), followed by replacement characters and Tab. NULL releases the Command modifier before typing. Read the actual input value before and after Tab and reject any mismatch with the requested text; keep the existing per-character focus check. Do not use Element Clear here: its standard resettable-input algorithm includes unfocusing, unlike keyboard replacement. These checks do not substitute for final adopted settings, model geometry or native interaction verification.
+
 ## Time, collection and failure
 
 Only public QA `YossiMH/part-stretch-public-qa` is a publication destination. Whitelist: `codemagic.yaml`, this file, the two test modules, `qa/stl.py`, `qa/webdriver.py`, `qa/native_safari.py`, `qa/file-controls.html`. Do not export private code/tests/validators/configuration/fixtures, credentials, customer files, browser profiles or handoff data. Runtime output is never committed to that whitelist.
