@@ -258,6 +258,8 @@ return {release:document.querySelector('meta[name="part-stretch-release"]')?.con
  editor:visible('editor')?'displayed':'absent',anchor_picker:visible('anchor-picker')?'displayed':'absent',
  focused:document.activeElement?.id||'',viewport:[innerWidth,innerHeight],
  document_ready:document.readyState,selected_file_count:document.getElementById('file')?.files?.length??null,
+ file_change_handler:typeof document.getElementById('file')?.onchange,
+ browse_click_handler:typeof document.getElementById('browse')?.onclick,
  load_error:visible('load-error')?text('load-error').slice(0,512):'',
  load_progress:visible('load-progress')?'displayed':'absent'};
 """), "NATIVE_DOM_OBSERVATION")
@@ -476,8 +478,13 @@ def _integration(session: Session, output: pathlib.Path, run_id: str, origin: st
           lambda value: value == 200, "NATIVE_STATIC_SERVER_STARTUP_DEADLINE")
     _command(session, "POST", "/url", {"url": origin + "/"}, "open-file-control-page")
     page_observation = _snapshot(session)
+    session[4]["preselection_dom_cache"] = session[4]["selected_dom"]
     if session[4].get("selected_dom") != page_observation:
         raise ValueError("NATIVE_OBSERVATION_CACHE_MISMATCH")
+    if (page_observation.get("file_change_handler") != "undefined"
+            or page_observation.get("browse_click_handler") != "undefined"
+            or session[4].get("preselection_dom_cache") != page_observation):
+        raise ValueError("NATIVE_PRESELECTION_OBSERVATION_MISMATCH")
     if page_observation.get("ui_error") != "" or page_observation.get("editor") != "absent":
         raise ValueError("NATIVE_FILE_CONTROL_OBSERVATION_MISMATCH")
     checks.append({"name": "page-observation-protocol-boundary", "dom": page_observation})
@@ -502,6 +509,8 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
     session[4]["stage"] = "first-public-navigation"
     _command(session, "POST", "/url", {"url": PUBLIC_URL}, "open-public-guest")
     session[4]["stage"] = "first-product-file-selection"
+    _snapshot(session)
+    session[4]["preselection_dom_cache"] = session[4]["selected_dom"]
     supplied = _supply_product_file(session, fixture)
     session[4]["stage"] = "first-model-dimensions-wait"
     imported = _model(session, size)
