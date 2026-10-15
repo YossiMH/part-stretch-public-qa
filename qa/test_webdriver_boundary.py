@@ -29,6 +29,14 @@ def test_response_value_is_preserved_without_coercion() -> None:
     assert parse_webdriver_response(200, b'{"value":[0,"text",null]}') == [0, "text", None]
 
 
+def test_page_error_text_remains_observation_data() -> None:
+    """Page error text uses its own field, separate from a WebDriver refusal."""
+    assert parse_webdriver_response(200, b'{"value":{"ui_error":"","editor":"absent"}}') == {
+        "ui_error": "", "editor": "absent"}
+    assert parse_webdriver_response(200, b'{"value":{"ui_error":"Invalid shrink","editor":"displayed"}}') == {
+        "ui_error": "Invalid shrink", "editor": "displayed"}
+
+
 def test_json_and_envelope_errors_cannot_become_success() -> None:
     """Malformed bytes, absent values and failed HTTP responses cannot admit a command."""
     for body in (b'not json', b'{"value":null} trailing', b'{"value":"\xff"}',
@@ -110,6 +118,7 @@ def test_foreign_or_missing_receipts_cannot_authorize_replay() -> None:
 def main() -> int:
     """Execute pure cases without a browser or service; every unexpected result fails."""
     tests = (test_response_value_is_preserved_without_coercion,
+             test_page_error_text_remains_observation_data,
              test_json_and_envelope_errors_cannot_become_success,
              test_remote_error_code_is_retained_without_raw_message,
              test_native_admission_requires_actual_host_and_session_fields,

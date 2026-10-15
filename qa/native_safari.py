@@ -251,7 +251,7 @@ return {release:document.querySelector('meta[name="part-stretch-release"]')?.con
  filename:text('filename'),dimensions:text('dimensions'),original_dimensions:text('original-dimensions'),
  start:value('start'),end:value('end'),delta:value('delta'),target:value('target'),units:value('units'),
  axis:document.querySelector('#precision-controls [data-axis][aria-pressed="true"]')?.getAttribute('data-axis')||'',
- error:visible('error-box')?text('error'):'',status:text('status'),view_note:text('view-note'),
+ ui_error:visible('error-box')?text('error'):'',status:text('status'),view_note:text('view-note'),
  editor:visible('editor')?'displayed':'absent',anchor_picker:visible('anchor-picker')?'displayed':'absent',
  focused:document.activeElement?.id||'',viewport:[innerWidth,innerHeight]};
 """), "NATIVE_DOM_OBSERVATION")
@@ -280,7 +280,7 @@ def _model(session: Session, size_mm: Point) -> dict[str, object]:
                              "NATIVE_MODEL_DIMENSIONS_DEADLINE"), "NATIVE_DOM_OBSERVATION")
     if observed.get("release") != PUBLIC_RELEASE or observed.get("services") != "guest-beta":
         raise ValueError("NATIVE_PUBLIC_RELEASE_MISMATCH")
-    if observed.get("error"):
+    if observed.get("ui_error"):
         raise ValueError("NATIVE_VISIBLE_PRODUCT_ERROR")
     return observed
 
@@ -466,6 +466,10 @@ def _integration(session: Session, output: pathlib.Path, run_id: str, origin: st
     _poll(min(session[3], time.monotonic() + 4.0), lambda: _static_status(origin, session[3]),
           lambda value: value == 200, "NATIVE_STATIC_SERVER_STARTUP_DEADLINE")
     _command(session, "POST", "/url", {"url": origin + "/"}, "open-file-control-page")
+    page_observation = _snapshot(session)
+    if page_observation.get("ui_error") != "" or page_observation.get("editor") != "absent":
+        raise ValueError("NATIVE_FILE_CONTROL_OBSERVATION_MISMATCH")
+    checks.append({"name": "page-observation-protocol-boundary", "dom": page_observation})
     selected = _select_file(session, "#fixture", fixture)
     checks.append({"name": "ordinary-file-selection", "selected": selected, "stl": summary})
     downloads = pathlib.Path.home() / "Downloads"
@@ -519,7 +523,7 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
     else:
         _type(session, "#delta", "-11")
         rejected = _object(_poll(session[3], lambda: _snapshot(session),
-                                 lambda value: len(str(_object(value, "NATIVE_DOM_OBSERVATION").get("error", ""))) > 0,
+                                 lambda value: len(str(_object(value, "NATIVE_DOM_OBSERVATION").get("ui_error", ""))) > 0,
                                  "NATIVE_INVALID_SHRINK_NOT_REJECTED"), "NATIVE_DOM_OBSERVATION")
         if not _matches_model(rejected, result_size):
             raise ValueError("NATIVE_INVALID_SHRINK_CHANGED_MODEL")
@@ -528,12 +532,12 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
             _click(session, "#undo")
             undo = _object(_poll(session[3], lambda: _snapshot(session), lambda value:
                 (_matches_model(value, size) or _matches_model(value, result_size))
-                and not _object(value, "NATIVE_DOM_OBSERVATION").get("error"),
+                and not _object(value, "NATIVE_DOM_OBSERVATION").get("ui_error"),
                 "NATIVE_UNDO_DID_NOT_SETTLE"), "NATIVE_DOM_OBSERVATION")
             checks.append({"name": "normal-undo-" + str(action_index + 1), "dom": undo})
-            if _matches_model(undo, size) and not undo.get("error"):
+            if _matches_model(undo, size) and not undo.get("ui_error"):
                 break
-            if not _matches_model(undo, result_size) or undo.get("error"):
+            if not _matches_model(undo, result_size) or undo.get("ui_error"):
                 raise ValueError("NATIVE_UNDO_DID_NOT_RESTORE_VALID_OPERATION")
         restored = _model(session, size)
         _settings(restored, end_mm, 0.0)
