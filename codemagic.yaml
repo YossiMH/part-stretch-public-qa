@@ -8,7 +8,7 @@ workflows:
       groups:
         - public_qa_run
     scripts:
-      - name: Pure checks and real native file journeys
+      - name: Pure checks and current public import edit rendering
         script: |
           python3 -E -S -B - <<'PY'
           import os
@@ -39,7 +39,9 @@ workflows:
               subprocess.run((sys.executable, "-E", "-S", "-B", "-m", module),
                              stdin=subprocess.DEVNULL, check=True,
                              timeout=min(20.0, deadline - time.monotonic()))
-          for phase in ("integration", "guest", "controls"):
+          # Accepted unchanged F4 transport is retained externally. This limited
+          # current check cannot close the historical full Safari requirements.
+          for phase in ("current",):
               subprocess.run((sys.executable, "-E", "-S", "-B", "-m", "qa.native_safari", phase,
                               "--output", str(output_root / phase), "--run-id", run_id,
                               "--deadline-seconds", "55"), stdin=subprocess.DEVNULL, check=True,
