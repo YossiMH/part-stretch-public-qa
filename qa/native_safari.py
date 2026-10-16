@@ -849,16 +849,93 @@ return {kind:context?'webgl2':'unobservable',loss:context?(context.isContextLost
         raise ValueError("NATIVE_VISIBLE_PRODUCT_ERROR")
 
 
+def _current_canvas_placement(value: object) -> dict[str, object]:
+    """Choose no input or one reachable page-wheel input from CSS-pixel observations.
+
+    A small margin is used only when scrolling is needed and fits. Gutter safety
+    requires both the observed normal-page target and a point outside the canvas;
+    this decision never dispatches input or mutates the supplied observations.
+    """
+    observed = _object(value, "NATIVE_CURRENT_CANVAS_PLACEMENT_OBSERVATION")
+    rectangle, viewport = observed.get("rectangle"), observed.get("viewport")
+    if not isinstance(rectangle, list) or len(rectangle) != 4 or not isinstance(viewport, list) or len(viewport) != 2:
+        raise ValueError("NATIVE_CURRENT_CANVAS_PLACEMENT_OBSERVATION")
+    left, top, width, height = (_number(item, "NATIVE_CURRENT_CANVAS_PLACEMENT_OBSERVATION") for item in rectangle)
+    viewport_width, viewport_height = (_number(item, "NATIVE_CURRENT_CANVAS_PLACEMENT_OBSERVATION") for item in viewport)
+    if width <= 0 or height <= 0 or left < 0 or left + width > viewport_width or height > viewport_height:
+        raise ValueError("NATIVE_CURRENT_CANVAS_CANNOT_FIT")
+    if 0 <= top and top + height <= viewport_height:
+        return {"action": "none"}
+    point = observed.get("gutter_point")
+    if not isinstance(point, list) or len(point) != 2 or observed.get("gutter_target") != "page-gutter":
+        raise ValueError("NATIVE_CURRENT_CANVAS_UNSAFE_GUTTER")
+    point_x, point_y = (math.floor(_number(item, "NATIVE_CURRENT_CANVAS_UNSAFE_GUTTER")) for item in point)
+    if (not 0 <= point_x < viewport_width or not 0 <= point_y < viewport_height
+            or left <= point_x < left + width and top <= point_y < top + height):
+        raise ValueError("NATIVE_CURRENT_CANVAS_UNSAFE_GUTTER")
+    scroll_y = _number(observed.get("scroll_y"), "NATIVE_CURRENT_CANVAS_PLACEMENT_OBSERVATION")
+    scroll_max_y = _number(observed.get("scroll_max_y"), "NATIVE_CURRENT_CANVAS_PLACEMENT_OBSERVATION")
+    if not 0 <= scroll_y <= scroll_max_y:
+        raise ValueError("NATIVE_CURRENT_CANVAS_CANNOT_FIT")
+    minimum_delta_y = math.ceil(max(top + height - viewport_height, -scroll_y))
+    maximum_delta_y = math.floor(min(top, scroll_max_y - scroll_y))
+    if minimum_delta_y > maximum_delta_y:
+        raise ValueError("NATIVE_CURRENT_CANVAS_CANNOT_FIT")
+    margin = min(16.0, (viewport_height - height) / 2.0)
+    requested_delta_y = math.floor(top - margin) if top < 0 else math.ceil(top + height - viewport_height + margin)
+    delta_y = max(minimum_delta_y, min(maximum_delta_y, requested_delta_y))
+    return {"action": "wheel", "x": point_x, "y": point_y, "delta_y": delta_y}
+
+
+def _current_canvas_position_observation(session: Session) -> dict[str, object]:
+    """Read real page geometry and hit-tested gutter without scrolling or touching app state."""
+    observed = _object(_read(session, """
+const canvas=document.getElementById('view'),rectangle=canvas.getBoundingClientRect();
+const x=Math.floor(Math.min(16,Math.max(0,rectangle.left/2))),y=Math.floor(innerHeight/2);
+const hit=document.elementFromPoint(x,y),scroller=document.scrollingElement;
+return {rectangle:[rectangle.left,rectangle.top,rectangle.width,rectangle.height],viewport:[innerWidth,innerHeight],
+ scroll_y:scroller?.scrollTop??null,scroll_max_y:scroller?Math.max(0,scroller.scrollHeight-scroller.clientHeight):null,
+ gutter_point:[x,y],gutter_target:hit&&['HTML','BODY','MAIN'].includes(hit.tagName)
+ &&!hit.closest('canvas,.viewport,button,input,select,textarea,a,summary,dialog,iframe,[contenteditable]')?'page-gutter':'unsafe'};
+"""), "NATIVE_CURRENT_CANVAS_PLACEMENT_OBSERVATION")
+    session[4]["current_canvas_placement_cache"] = observed
+    return observed
+
+
+def _current_position_canvas(session: Session, name: str, checks: Checks) -> None:
+    """Own at most one ordinary page scroll and full-layout admission before capture.
+
+    The gutter avoids the viewer's wheel-to-zoom handler. An unknown/refused input,
+    absent movement or incomplete result fails without another scroll or image.
+    """
+    before = _current_canvas_position_observation(session)
+    placement = _current_canvas_placement(before)
+    checks.append({"name": "canvas-placement:" + name, "before": before, "decision": placement})
+    if placement["action"] == "wheel":
+        _command(session, "POST", "/actions", {"actions": [{"type": "wheel", "id": "native-page-wheel", "actions": [
+            {"type": "scroll", "duration": 120, "origin": "viewport", "x": placement["x"], "y": placement["y"],
+             "deltaX": 0, "deltaY": placement["delta_y"]}]}]}, "current-canvas-page-scroll")
+        after = _current_canvas_position_observation(session)
+        checks.append({"name": "canvas-after-page-scroll:" + name, "after": after})
+        movement = _number(after.get("scroll_y"), "NATIVE_CURRENT_CANVAS_PLACEMENT_OBSERVATION") - _number(
+            before.get("scroll_y"), "NATIVE_CURRENT_CANVAS_PLACEMENT_OBSERVATION")
+        if movement * _number(placement["delta_y"], "NATIVE_CURRENT_CANVAS_PLACEMENT_OBSERVATION") <= 0:
+            raise ValueError("NATIVE_CURRENT_CANVAS_SCROLL_NOT_OBSERVED")
+    checks.append({"name": "canvas-layout-before-capture:" + name, "layout": _layout(session, ("#view",))})
+
+
 def _current_stage_images(session: Session, output: pathlib.Path, stage: str, checks: Checks, images: Images) -> None:
     """Keep native stage originals and require a complete visible canvas target.
 
     Editor clipping remains recorded rather than repaired by alternate pixels.
-    The separate canvas must fit its actual viewport after standard element
-    capture; proportional PNG dimensions reject a truncated native canvas frame.
+    Position the separate canvas before its sole standard capture, then retain
+    full layout and proportional-PNG checks after capture as well.
     Actual model visibility still requires executor and independent image views.
     """
     for suffix, target in (("", "viewport"), ("-editor", "#editor"), ("-canvas", "#view")):
         image_name = stage + suffix
+        if target == "#view":
+            _current_position_canvas(session, image_name, checks)
         _current_graphics(session, "before-capture:" + image_name, checks)
         descriptor = _capture(session, output, image_name, images, target)
         if target == "#view":
