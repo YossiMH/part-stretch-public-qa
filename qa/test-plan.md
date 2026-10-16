@@ -1,6 +1,34 @@
 # Native Safari public-file tests
 
-This is a newly written public test specification. It contains no product implementation or private test/validator copy. Pure tests do not establish a browser result. Integration tests use real native Safari and real files; the guest run uses only `https://part-stretch-free.pages.dev/`, release `9b0731642df08c879cbea912b6ff7daf3401a164`, with the observed `guest-beta` services marker. Desktop Safari is not physical iOS. Account, cloud storage, purchases, receipts, refunds and interrupted checkout remain on their separate service-enabled path.
+This public specification contains no product implementation or private test/validator copy. Pure tests do not establish a browser result. The historical full guest/controls commands below retain `https://part-stretch-free.pages.dev/`, release `9b0731642df08c879cbea912b6ff7daf3401a164`, and its `guest-beta` services marker. The separately named current check tests the actual current public app. Desktop Safari is not physical iOS. Account, cloud storage, purchases, receipts, refunds and interrupted checkout remain on their separate service-enabled path.
+
+## Current public import, edit and rendering
+
+The manual workflow currently runs the permanent pure modules and only:
+
+    python3 -E -S -B -m qa.native_safari current --output DIR --run-id ID --deadline-seconds 55
+
+This is `current-public-native-import-edit-render`, a limited result inside unfinished full Safari qualification. It does not run Download, Pay, Sign in, cloud save, Send, reload, Resume or exact output reopen. Current services use $2.99 TEST checkout. No paid entitlement, hidden free path or old purchase is assumed.
+
+The fixed target is `https://part-stretch-app.netlify.app`, services `required`, declared product/source/asset-source `13aa60e02304d49b6e92bfc997ff027604b75c6f`. Retained release records separately identify runtime baseline `79c9da3daed8893c81607618528ce89d118d956e`; the actual manifest has no runtime-baseline field. After normal navigation/startup, three unauthenticated HTTPS GETs must return 200 without redirects and match complete bodies:
+
+- `preview-release.json`: `c878189c48e37d2f12893e2b4daebc32181cceda4ba5626ef2a8c894f76c7941`
+- `app.js`: `00bda7479576df48f98b8183ed6bff1893216bf0c92fd3e3cbe5cfaaaf79ece6`
+- `viewer.js`: `8a29738154aee3b2b193922b133ab79db91be8d227a9e7105c08a7f2e255dfc5`
+
+Each GET has at most 5 seconds, at most 256 KiB, and consumes the same 55-second phase deadline. Only body paths/status/lengths/digests and the manifest's actual declared fields are logged; source bodies are not retained. The permanent literal-data current-identity case rejects old/wrong/missing metadata or digests. The old CLI has no current phase or current-identity decision, so its actual unsupported-current CLI result is the honest before observation; a missing newly named Python helper is not counted as behavioral Red.
+
+Require the visible signed-out decision, absent existing filename/editor/recovery and no open dialog before supplying one fresh fully validated synthetic 17x11x7 mm / 1309 mm3 STL through the normal file input. Never clear retained state to make this precondition pass. Keep genuine path/receipt/pre-and-post bytes/hash and settled adopted filename/model. Millimeters are the normal default; no private file or product-state injection.
+
+At import, retain native viewport, `#editor` and complete `#view` images. Use the existing region/X/exact/numeric/Tab preparation for 5..12, prepare +3, Keep start end fixed, return delta 0, then +3. Require original 17x11x7 / current 20x11x7, start 5 / end 12 / delta 3 / target 10 / X, empty product error, target focus and usable numeric fields. Retain the same three native stage images at edit. Read only the existing app-owned WebGL2 context/version/dimensions and `isContextLost()` immediately around those captures, reporting `healthy|lost|unobservable`. No replacement/probe context, loss injection, page-function patch or event listener. Observed loss timing cannot alone identify its cause.
+
+Then reuse the unchanged same-canvas orbit/Shift-pan/wheel/focus check and all four original images; require equal positive image dimensions, distinct complete hashes and unchanged model/settings. Executor and reviewer must actually view every original and see the imported/edited model and changed camera pose/framing. Blank PNGs, crop/hash/DOM/context metadata or unviewed images cannot pass. A clipped editor stays recorded as clipped: the separate complete canvas can establish this limited graphics observation, but does not replace the original full-stage editor-image requirement. No full Safari closure follows.
+
+Accepted F4 ordinary file/numeric/capture transport remains historical and externally retained. The current phase has no same-run integration prerequisite and does not rerun unchanged transport; old guest/controls prerequisite enforcement remains intact. Integration and its transitive helpers must remain byte-identical. A changed transport path returns to root for a separate decision rather than inheriting a stale pass.
+
+One separately commissioned disposable manual job only: same Mac mini M2 / xcode27.0 / public QA workflow, fresh fully loaded Personal Free balance >=10 minutes and billing off, fresh journaled run ID, SSH/VNC unchecked, one final dispatch. Do not reuse an earlier balance. Preserve the 5-minute whole job, 240-second script, 55-second phase plus 5-second cleanup, 22-PNG maximum, 256 KiB each and 1 MiB encoded records. This check produces at most 10 product PNGs. Stop first automated failure; actual visual insufficiency after collection prevents acceptance and an automatic next job. Unknown outcomes retain their receipt and are never replayed. No new service, grant, OAuth, credentials/settings/install, private upload, source-body logging, arbitrary delay, alternate capture or enlarged limit.
+
+The historical full requirements below, including exact downloaded output/reopen, complete stage images, invalid shrink/Undo, remain pending for the actual current application. Full financial/native continuation is considered only after this limited current result passes and is separately commissioned. Accounts/save-return-retune, TEST payment/receipt/refund/interruption, support/privacy/metrics, physical devices/iOS or truthful support decision, recurring capacity, beta, both promotions and paid launch keep their separate required paths.
 
 ## Permanent pure commands and initial failure
 
