@@ -180,6 +180,25 @@ def test_json_and_envelope_errors_cannot_become_success() -> None:
         _reject("WEBDRIVER_HTTP_STATUS", lambda: parse_webdriver_response(status, b'{"value":null}'))
 
 
+def test_current_canvas_placement_scrolls_only_a_safe_reachable_gutter() -> None:
+    """The recorded crop needs one page scroll; fit and target failures must not dispatch it."""
+    from qa.native_safari import _current_canvas_placement
+
+    clipped = {"rectangle": [32, 424.765625, 656, 451], "viewport": [1024, 716],
+               "scroll_y": 0, "scroll_max_y": 500, "gutter_point": [16, 358], "gutter_target": "page-gutter"}
+    assert _current_canvas_placement(clipped) == {"action": "wheel", "x": 16, "y": 358, "delta_y": 176}
+    assert _current_canvas_placement({**clipped, "scroll_max_y": 160}) == {
+        "action": "wheel", "x": 16, "y": 358, "delta_y": 160}
+    assert _current_canvas_placement({**clipped, "rectangle": [32, 100, 656, 451],
+                                      "gutter_target": "unsafe"}) == {"action": "none"}
+    _reject("NATIVE_CURRENT_CANVAS_CANNOT_FIT", lambda: _current_canvas_placement(
+        {**clipped, "rectangle": [32, 0, 656, 717]}))
+    _reject("NATIVE_CURRENT_CANVAS_CANNOT_FIT", lambda: _current_canvas_placement({**clipped, "scroll_max_y": 80}))
+    _reject("NATIVE_CURRENT_CANVAS_UNSAFE_GUTTER", lambda: _current_canvas_placement({**clipped, "gutter_target": "unsafe"}))
+    _reject("NATIVE_CURRENT_CANVAS_UNSAFE_GUTTER", lambda: _current_canvas_placement({**clipped, "gutter_point": [100, 500]}))
+    assert clipped["rectangle"] == [32, 424.765625, 656, 451]
+
+
 def test_remote_error_code_is_retained_without_raw_message() -> None:
     """A diagnostic code is useful without exposing a raw session message or stack."""
     body = b'{"value":{"error":"invalid argument","message":"must-not-be-logged/session/private-path","stacktrace":"must-not-be-logged"}}'
@@ -259,6 +278,7 @@ def main() -> int:
              test_camera_pair_requires_completed_same_canvas_images,
              test_current_model_retains_its_original_dimensions_after_edit,
              test_json_and_envelope_errors_cannot_become_success,
+             test_current_canvas_placement_scrolls_only_a_safe_reachable_gutter,
              test_remote_error_code_is_retained_without_raw_message,
              test_native_admission_requires_actual_host_and_session_fields,
              test_current_safari_release_includes_whole_major_labels,
