@@ -350,21 +350,89 @@ return context?{kind:'webgl2',version:context.getParameter(context.VERSION),
     return observed
 
 
-def _capture(session: Session, output: pathlib.Path, name: str, images: Images) -> None:
-    """Keep the actual WebDriver PNG; size limits fail collection without resampling."""
-    encoded = _string(_command(session, "GET", "/screenshot", None, "screenshot:" + name), "NATIVE_SCREENSHOT_MISSING")
-    try:
-        payload = base64.b64decode(encoded, validate=True)
-    except ValueError:
-        raise ValueError("NATIVE_SCREENSHOT_ENCODING") from None
-    path = output / (name + ".png")
-    with path.open("xb") as stream:
-        stream.write(payload)
+def _png_dimensions(payload: bytes) -> tuple[int, int]:
+    """Read PNG IHDR pixel dimensions without decoding or classifying image content."""
     if not payload.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("NATIVE_SCREENSHOT_NOT_PNG")
-    images.append({"name": name, "png_bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()})
-    if len(payload) > PNG_BYTE_LIMIT:
-        raise ValueError("NATIVE_IMAGE_COLLECTION_INCOMPLETE:PNG_LIMIT")
+    if len(payload) < 33 or payload[8:16] != b"\x00\x00\x00\rIHDR":
+        raise ValueError("NATIVE_SCREENSHOT_HEADER")
+    width, height = int.from_bytes(payload[16:20], "big"), int.from_bytes(payload[20:24], "big")
+    if not 0 < width < 0x80000000 or not 0 < height < 0x80000000:
+        raise ValueError("NATIVE_SCREENSHOT_DIMENSIONS")
+    return width, height
+
+
+def _camera_pair_changed(before: object, after: object) -> bool:
+    """Require completed same-size native canvas captures with different byte hashes.
+
+    Callers own actual method/element provenance. This predicate cannot establish
+    visible model content or camera movement; both images still require viewing.
+    """
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    for image in (before, after):
+        width, height, sha256 = image.get("png_width"), image.get("png_height"), image.get("sha256")
+        if (image.get("capture_method") != "element" or image.get("target") != "#view"
+                or image.get("outcome") != "completed"
+                or not isinstance(width, int) or isinstance(width, bool) or width <= 0
+                or not isinstance(height, int) or isinstance(height, bool) or height <= 0
+                or not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None):
+            return False
+    return (before["png_width"] == after["png_width"] and before["png_height"] == after["png_height"]
+            and before["sha256"] != after["sha256"])
+
+
+def _capture(session: Session, output: pathlib.Path, name: str, images: Images,
+             target: str = "viewport", element: str = "") -> dict[str, object]:
+    """Retain unmodified native PNGs and capture outcomes, including failed attempts.
+
+    Element targets use the standard endpoint; a supplied reference binds camera
+    captures to the exact canvas used by Actions. Unsupported/uncertain commands
+    fail without another method or replay. Headers expose dimensions, not pixels.
+    """
+    capture_method = "viewport" if target == "viewport" else "element"
+    attempt: dict[str, object] = {"name": name, "capture_method": capture_method,
+                                 "target": target, "outcome": "unknown", "command_outcome": "not-dispatched"}
+    capture_cache = session[4].setdefault("capture_observations_cache", [])
+    if not isinstance(capture_cache, list):
+        raise ValueError("NATIVE_CAPTURE_CACHE_INVALID")
+    capture_cache.append(attempt)
+    try:
+        route = "/screenshot"
+        if capture_method == "element":
+            element = element or _element(session, target)
+            route = "/element/" + element + "/screenshot"
+        attempt["command_outcome"] = "unknown"
+        receipt = _command(session, "GET", route, None, "screenshot:" + name)
+        attempt["command_outcome"] = "completed"
+        encoded = _string(receipt, "NATIVE_SCREENSHOT_MISSING")
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except ValueError:
+            raise ValueError("NATIVE_SCREENSHOT_ENCODING") from None
+        path = output / (name + ".png")
+        with path.open("xb") as stream:
+            stream.write(payload)
+        attempt.update({"png_bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()})
+        width, height = _png_dimensions(payload)
+        record: dict[str, object] = {**attempt, "outcome": "completed", "png_width": width, "png_height": height}
+        images.append(record)
+        attempt.update(record)
+        if len(payload) > PNG_BYTE_LIMIT:
+            raise ValueError("NATIVE_IMAGE_COLLECTION_INCOMPLETE:PNG_LIMIT")
+        return record
+    except Exception as error:
+        code = _failure_code(error)
+        attempt["code"] = code
+        if (attempt["command_outcome"] == "unknown"
+                and code in ("WEBDRIVER_REMOTE_ERROR:unknown command", "WEBDRIVER_REMOTE_ERROR:unsupported operation")):
+            attempt["outcome"] = "unsupported"
+            attempt["command_outcome"] = "refused"
+        else:
+            attempt["outcome"] = "unknown" if code.startswith("NATIVE_COMMAND_OUTCOME_UNKNOWN:") else "error"
+            if attempt["command_outcome"] == "unknown" and code.startswith("WEBDRIVER_REMOTE_ERROR:"):
+                attempt["command_outcome"] = "refused"
+        raise
 
 
 def _new_fixture(output: pathlib.Path, run_id: str, phase: str, size_mm: Point) -> tuple[pathlib.Path, dict[str, object]]:
@@ -472,10 +540,23 @@ return {viewport:[innerWidth,innerHeight],controls:arguments[0].map(selector=>{
 
 
 def _view_controls(session: Session, output: pathlib.Path, images: Images) -> dict[str, object]:
-    """Exercise ordinary orbit, shift-pan and wheel zoom; retain native before/after images."""
+    """Exercise normal camera Actions on the same real canvas captured before/after.
+
+    Native element images are canonical; viewport originals remain diagnostic.
+    Element scrolling occurs outside the viewport pair. Actual viewing must still
+    distinguish model motion from blank images, metadata or focus decoration.
+    """
     _click(session, "#view")
-    _capture(session, output, "view-before", images)
     element = _element(session, "#view")
+    canvas_identity_script = ("return arguments[0]===document.getElementById('view')"
+                              "&&arguments[0].tagName==='CANVAS'?'same-view-canvas':'other';")
+    if _read(session, canvas_identity_script, ({ELEMENT_KEY: element},)) != "same-view-canvas":
+        raise ValueError("NATIVE_VIEW_CANVAS_IDENTITY_MISMATCH")
+    session[4]["stage"] = "view-camera-before"
+    before = _capture(session, output, "view-before-canvas", images, "#view", element)
+    before_layout = _layout(session, ("#view",))
+    _capture(session, output, "view-before", images)
+    session[4]["stage"] = "view-camera-actions"
     for modifier, offset in (("", 45), ("\ue008", -35)):
         pointer_actions: list[dict[str, object]] = [
             {"type": "pointerMove", "duration": 0, "origin": {ELEMENT_KEY: element}, "x": 0, "y": 0},
@@ -493,12 +574,17 @@ def _view_controls(session: Session, output: pathlib.Path, images: Images) -> di
         {"type": "scroll", "duration": 120, "origin": {ELEMENT_KEY: element}, "x": 0, "y": 0,
          "deltaX": 0, "deltaY": -120}]}]}, "view-wheel-zoom")
     _capture(session, output, "view-after", images)
-    if images[-1].get("sha256") == images[-2].get("sha256"):
+    session[4]["stage"] = "view-camera-after"
+    if _read(session, canvas_identity_script, ({ELEMENT_KEY: element},)) != "same-view-canvas":
+        raise ValueError("NATIVE_VIEW_CANVAS_IDENTITY_MISMATCH")
+    after = _capture(session, output, "view-after-canvas", images, "#view", element)
+    if not _camera_pair_changed(before, after):
         raise ValueError("NATIVE_VIEW_CHANGE_NOT_OBSERVED")
     focused = _read(session, "return document.activeElement?.id||'';")
     if focused != "view":
         raise ValueError("NATIVE_VIEW_KEYBOARD_FOCUS_LOST")
     return {"actions": ["orbit-drag", "shift-drag-pan", "wheel-zoom"], "focused": focused,
+            "camera_images": {"before": before, "after": after}, "before_layout": before_layout,
             "layout": _layout(session, ("#view",))}
 
 
@@ -544,6 +630,15 @@ def _integration(session: Session, output: pathlib.Path, run_id: str, origin: st
         raise ValueError("NATIVE_NUMBER_TAB_FOCUS_MISMATCH")
     checks.append({"name": "handler-free-number-replacement", "dom": number_observation})
     _capture(session, output, "integration-file-controls", images)
+    heading = _object(_read(session, """
+const e=document.querySelector('h1');if(!e)return {};
+const r=e.getBoundingClientRect();return {text:e.textContent.trim(),rectangle:[r.left,r.top,r.width,r.height],
+ visibility:getComputedStyle(e).visibility,viewport:[innerWidth,innerHeight]};
+"""), "NATIVE_INTEGRATION_HEADING_UNOBSERVABLE")
+    if heading.get("text") != "Native file controls":
+        raise ValueError("NATIVE_INTEGRATION_HEADING_MISMATCH")
+    checks.append({"name": "native-capture-static-target", "dom": heading})
+    _capture(session, output, "integration-heading-element", images, "h1")
 
 
 def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, checks: Checks, images: Images) -> None:
@@ -568,6 +663,7 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
     checks.append({"name": "normal-import", "supplied_file": supplied, "stl": summary, "dom": imported, "webgl": _webgl(session)})
     session[4]["stage"] = "first-import-verified"
     _capture(session, output, "imported-model", images)
+    _capture(session, output, "imported-model-editor", images, "#editor")
     original_operation = _edit(session, size, end_mm, delta_mm)
     edited = _model(session, result_size)
     _settings(edited, end_mm, delta_mm)
@@ -576,6 +672,7 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
     checks.append({"name": "normal-fixed-start-X-edit", "anchor_control": "data-anchor=1", "dom": edited,
                    "original_operation": original_operation, "layout": _layout(session, ("#delta", "#target"))})
     _capture(session, output, "edited-model", images)
+    _capture(session, output, "edited-model-editor", images, "#editor")
     if phase == "guest":
         resume_control = _resume(session)
         resumed = _model(session, result_size)
@@ -596,6 +693,7 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
         checks.append({"name": "exact-downloaded-file-reopen", "supplied_file": reopened, "dom": reopened_model, "webgl": _webgl(session)})
         session[4]["stage"] = "exact-downloaded-file-reopen-verified"
         _capture(session, output, "reopened-model", images)
+        _capture(session, output, "reopened-model-editor", images, "#editor")
     else:
         _type(session, "#delta", "-11")
         rejected = _object(_poll(session[3], lambda: _snapshot(session),
@@ -619,6 +717,7 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
         _settings(restored, end_mm, 0.0)
         checks.append({"name": "undo-original-model-and-operation", "dom": restored})
         _capture(session, output, "undo-original-model", images)
+        _capture(session, output, "undo-original-model-editor", images, "#editor")
     checks.append({"name": "view-and-focus-controls", **_view_controls(session, output, images)})
     checks.append({"name": "model-after-view-controls", "dom": _model(session, result_size if phase == "guest" else size)})
 
