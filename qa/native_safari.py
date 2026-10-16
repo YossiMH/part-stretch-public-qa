@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -35,10 +36,19 @@ from qa.webdriver import (admit_native_session, latest_stable_safari_version,
                           parse_webdriver_response, product_startup_ready, require_current_safari_version, write_next_action)
 
 
-# The public guest release is the only product target. Resource limits are policy,
-# not conclusions about a model, a browser's capabilities, or image contents.
+# Historical full guest checks retain their target; current is a separate limited
+# check. Limits describe admitted work, not browser capability or visible pixels.
 PUBLIC_URL = "https://part-stretch-free.pages.dev/"
 PUBLIC_RELEASE = "9b0731642df08c879cbea912b6ff7daf3401a164"
+# Bind current declarations and actual served bytes independently. The manifest
+# declares 13aa; retained release records identify its runtime baseline as 79c9.
+CURRENT_ORIGIN = "https://part-stretch-app.netlify.app"
+CURRENT_RELEASE = "13aa60e02304d49b6e92bfc997ff027604b75c6f"
+CURRENT_BODY_SHA256 = {
+    "preview-release.json": "c878189c48e37d2f12893e2b4daebc32181cceda4ba5626ef2a8c894f76c7941",
+    "app.js": "00bda7479576df48f98b8183ed6bff1893216bf0c92fd3e3cbe5cfaaaf79ece6",
+    "viewer.js": "8a29738154aee3b2b193922b133ab79db91be8d227a9e7105c08a7f2e255dfc5"}
+CURRENT_BODY_BYTE_LIMIT = 256 * 1024
 APPLE_RELEASES_URL = "https://support.apple.com/en-us/100100"
 PNG_BYTE_LIMIT = 256 * 1024
 IMAGE_LOG_BYTE_LIMIT = 1024 * 1024
@@ -309,12 +319,13 @@ def _matches_model(observed: object, size_mm: Point, expected_filename: str = ""
             and all(abs(size[axis] - size_mm[axis]) <= 0.0001 for axis in range(3)))
 
 
-def _model(session: Session, size_mm: Point, expected_filename: str = "") -> dict[str, object]:
+def _model(session: Session, size_mm: Point, expected_filename: str = "",
+           expected_release: str = PUBLIC_RELEASE, expected_services: str = "guest-beta") -> dict[str, object]:
     """Wait for settled public geometry/source and reject its displayed error."""
     observed = _object(_poll(session[3], lambda: _snapshot(session),
                              lambda value: _matches_model(value, size_mm, expected_filename),
                              "NATIVE_MODEL_DIMENSIONS_DEADLINE"), "NATIVE_DOM_OBSERVATION")
-    if observed.get("release") != PUBLIC_RELEASE or observed.get("services") != "guest-beta":
+    if observed.get("release") != expected_release or observed.get("services") != expected_services:
         raise ValueError("NATIVE_PUBLIC_RELEASE_MISMATCH")
     if observed.get("ui_error"):
         raise ValueError("NATIVE_VISIBLE_PRODUCT_ERROR")
@@ -474,7 +485,8 @@ def _prepare_download(directory: pathlib.Path, token: str) -> None:
         raise ValueError("NATIVE_DOWNLOAD_IDENTITY_ALREADY_EXISTS")
 
 
-def _edit(session: Session, size_mm: Point, end_mm: float, delta_mm: float) -> dict[str, object]:
+def _edit(session: Session, size_mm: Point, end_mm: float, delta_mm: float,
+          expected_release: str = PUBLIC_RELEASE, expected_services: str = "guest-beta") -> dict[str, object]:
     """Choose the numeric X band and fixed-start anchor through visible controls."""
     session[4]["stage"] = "edit-choose-region"
     _click(session, "#choose")
@@ -502,7 +514,7 @@ def _edit(session: Session, size_mm: Point, end_mm: float, delta_mm: float) -> d
     _click(session, '[data-anchor="1"]')
     session[4]["stage"] = "prepare-anchored-zero-delta"
     _type(session, "#delta", "0")
-    original_operation = _model(session, size_mm)
+    original_operation = _model(session, size_mm, expected_release=expected_release, expected_services=expected_services)
     _settings(original_operation, end_mm, 0.0)
     session[4]["stage"] = "edit-requested-delta"
     _type(session, "#delta", format(delta_mm, ".9g"))
@@ -722,6 +734,202 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
     checks.append({"name": "model-after-view-controls", "dom": _model(session, result_size if phase == "guest" else size)})
 
 
+def _current_identity_matches(observed: object) -> bool:
+    """Require current declarations and complete public body hashes as separate facts."""
+    return (isinstance(observed, dict) and observed.get("origin") == CURRENT_ORIGIN
+            and observed.get("release") == CURRENT_RELEASE and observed.get("services") == "required"
+            and observed.get("manifest_product_commit") == CURRENT_RELEASE
+            and observed.get("manifest_asset_source_commit") == CURRENT_RELEASE
+            and observed.get("body_sha256") == CURRENT_BODY_SHA256)
+
+
+def _current_page(session: Session) -> dict[str, object]:
+    """Observe public UI only; never read auth storage or replace retained work."""
+    observed = _object(_read(session, """
+const visible=id=>{const element=document.getElementById(id);return element&&element.getClientRects().length>0;};
+return {origin:location.origin,release:document.querySelector('meta[name="part-stretch-release"]')?.content||'',
+ services:document.querySelector('meta[name="part-stretch-services"]')?.content||'',
+ account_access:document.getElementById('unpaid-backup')?.dataset.access||'',
+ sign_in:visible('sign-in')?'displayed':'absent',sign_out:visible('sign-out')?'displayed':'absent',
+ recovery:['resume-local-job','unpaid-recovery'].filter(visible),
+ open_dialog_count:document.querySelectorAll('dialog[open]').length};
+"""), "NATIVE_CURRENT_PAGE_UNOBSERVABLE")
+    session[4]["current_page_cache"] = observed
+    if (observed.get("origin") != CURRENT_ORIGIN or observed.get("release") != CURRENT_RELEASE
+            or observed.get("services") != "required"):
+        raise ValueError("NATIVE_CURRENT_PUBLIC_DECLARATION_MISMATCH")
+    return observed
+
+
+def _current_empty_page(session: Session) -> dict[str, object]:
+    """Wait for the visible guest decision, then refuse any prior model or recovery UI."""
+    observed = _object(_poll(session[3], lambda: _current_page(session),
+                             lambda value: _object(value, "NATIVE_CURRENT_PAGE_UNOBSERVABLE").get("account_access")
+                             in ("guest", "account"), "NATIVE_CURRENT_ACCOUNT_UI_DEADLINE"),
+                       "NATIVE_CURRENT_PAGE_UNOBSERVABLE")
+    snapshot = _snapshot(session)
+    if (observed.get("account_access") != "guest" or observed.get("sign_out") != "absent"
+            or observed.get("sign_in") != "displayed" or observed.get("recovery") != []
+            or observed.get("open_dialog_count") != 0 or snapshot.get("filename")
+            or snapshot.get("editor") != "absent"):
+        raise ValueError("NATIVE_CURRENT_RETAINED_OR_AUTH_UI_PRESENT")
+    return observed
+
+
+def _current_public_identity(session: Session, page: dict[str, object]) -> dict[str, object]:
+    """Hash three bounded unauthenticated HTTPS bodies without following redirects.
+
+    Only selected metadata and complete digests enter diagnostics. The synchronous
+    connection is closed on every outcome; the phase alarm bounds DNS and total
+    work. Temporarily shorten that same alarm to five seconds for each whole GET,
+    then restore its remaining phase budget; the existing handler only raises.
+    """
+    bodies_cache: list[dict[str, object]] = []
+    session[4]["current_public_bodies_cache"] = bodies_cache
+    observed_hashes: dict[str, str] = {}
+    manifest: dict[str, object] = {}
+    for relative_path, expected_sha256 in CURRENT_BODY_SHA256.items():
+        operation_id = uuid.uuid4().hex
+        _journal(session[2], {"operation_id": operation_id, "name": "current-public-body:" + relative_path,
+                             "method": "GET", "outcome": "unknown"})
+        request_deadline = min(session[3], time.monotonic() + 5.0)
+        connection = http.client.HTTPSConnection(urllib.parse.urlsplit(CURRENT_ORIGIN).netloc,
+                                                  timeout=_remaining(request_deadline, 5.0))
+        signal.setitimer(signal.ITIMER_REAL, _remaining(request_deadline, 5.0))
+        try:
+            connection.request("GET", "/" + relative_path, headers={"Accept": "*/*"})
+            response = connection.getresponse()
+            if response.status != 200:
+                raise ValueError("NATIVE_CURRENT_PUBLIC_BODY_STATUS:" + str(response.status))
+            content = response.read(CURRENT_BODY_BYTE_LIMIT + 1)
+            if len(content) > CURRENT_BODY_BYTE_LIMIT:
+                raise ValueError("NATIVE_CURRENT_PUBLIC_BODY_LIMIT")
+            observed_sha256 = hashlib.sha256(content).hexdigest()
+            bodies_cache.append({"path": relative_path, "status": response.status,
+                                 "bytes": len(content), "sha256": observed_sha256})
+            observed_hashes[relative_path] = observed_sha256
+            if observed_sha256 != expected_sha256:
+                raise ValueError("NATIVE_CURRENT_PUBLIC_BODY_MISMATCH:" + relative_path)
+            if relative_path == "preview-release.json":
+                manifest = _object(json.loads(content.decode("utf-8")), "NATIVE_CURRENT_MANIFEST_FORMAT")
+        except TimeoutError:
+            raise TimeoutError("NATIVE_CURRENT_PUBLIC_BODY_DEADLINE:" + relative_path) from None
+        finally:
+            connection.close()
+            signal.setitimer(signal.ITIMER_REAL, max(0.001, session[3] - time.monotonic()))
+        _journal(session[2], {"operation_id": operation_id, "name": "current-public-body:" + relative_path,
+                             "outcome": "completed"})
+    identity = {"origin": page.get("origin"), "release": page.get("release"), "services": page.get("services"),
+                "manifest_product_commit": manifest.get("product_commit"),
+                "manifest_asset_source_commit": manifest.get("asset_source_commit"), "body_sha256": observed_hashes}
+    if not _current_identity_matches(identity):
+        raise ValueError("NATIVE_CURRENT_PUBLIC_IDENTITY_MISMATCH")
+    return identity
+
+
+def _current_graphics(session: Session, stage: str, checks: Checks) -> None:
+    """Observe the already-owned context and selected error UI at a named boundary.
+
+    Normal model adoption is the prerequisite; this never creates a fallback
+    context, listens for events, injects loss or calls application functions.
+    """
+    observed = _object(_read(session, """
+const canvas=document.getElementById('view'),context=canvas.getContext('webgl2');
+const rectangle=canvas.getBoundingClientRect();
+return {kind:context?'webgl2':'unobservable',loss:context?(context.isContextLost()?'lost':'healthy'):'unobservable',
+ version:context&&!context.isContextLost()?context.getParameter(context.VERSION):'',
+ width:canvas.width,height:canvas.height,rectangle:[rectangle.left,rectangle.top,rectangle.width,rectangle.height]};
+"""), "NATIVE_CURRENT_GRAPHICS_UNOBSERVABLE")
+    snapshot = _snapshot(session)
+    checks.append({"name": stage, "graphics": observed, "dom": snapshot})
+    if (observed.get("kind") != "webgl2" or observed.get("loss") != "healthy"
+            or "WebGL 2" not in str(observed.get("version"))):
+        raise ValueError("NATIVE_CURRENT_GRAPHICS_NOT_HEALTHY:" + stage)
+    if snapshot.get("ui_error"):
+        raise ValueError("NATIVE_VISIBLE_PRODUCT_ERROR")
+
+
+def _current_stage_images(session: Session, output: pathlib.Path, stage: str, checks: Checks, images: Images) -> None:
+    """Keep native stage originals and require a complete visible canvas target.
+
+    Editor clipping remains recorded rather than repaired by alternate pixels.
+    The separate canvas must fit its actual viewport after standard element
+    capture; proportional PNG dimensions reject a truncated native canvas frame.
+    Actual model visibility still requires executor and independent image views.
+    """
+    for suffix, target in (("", "viewport"), ("-editor", "#editor"), ("-canvas", "#view")):
+        image_name = stage + suffix
+        _current_graphics(session, "before-capture:" + image_name, checks)
+        descriptor = _capture(session, output, image_name, images, target)
+        if target == "#view":
+            layout = _layout(session, ("#view",))
+            rectangle = _object(layout["controls"][0], "NATIVE_CURRENT_CANVAS_LAYOUT")["rectangle"]
+            expected_height = _number(descriptor.get("png_width"), "NATIVE_SCREENSHOT_DIMENSIONS") * rectangle[3] / rectangle[2]
+            if abs(_number(descriptor.get("png_height"), "NATIVE_SCREENSHOT_DIMENSIONS") - expected_height) > 2:
+                raise ValueError("NATIVE_CURRENT_CANVAS_CAPTURE_CLIPPED")
+            checks.append({"name": "complete-canvas-capture:" + image_name, "layout": layout, "image": descriptor})
+        _current_graphics(session, "after-capture:" + image_name, checks)
+
+
+def _current_original_dimensions_match(observed: object) -> bool:
+    """Keep the current check's millimeter source size separate from its edited size."""
+    if not isinstance(observed, dict):
+        return False
+    try:
+        original_mm = _dimensions(observed.get("original_dimensions"))
+    except ValueError:
+        return False
+    return all(abs(original_mm[axis] - expected) <= 0.0001
+               for axis, expected in enumerate((17.0, 11.0, 7.0)))
+
+
+def _current_product(session: Session, output: pathlib.Path, run_id: str, checks: Checks, images: Images) -> None:
+    """Test current import/edit/render only; no entitlement, download or persisted-state shortcut."""
+    session[4]["stage"] = "current-public-navigation"
+    _command(session, "POST", "/url", {"url": CURRENT_ORIGIN + "/"}, "open-current-public")
+    startup = _object(_poll(session[3], lambda: _snapshot(session), product_startup_ready,
+                            "NATIVE_PUBLIC_STARTUP_DEADLINE"), "NATIVE_DOM_OBSERVATION")
+    checks.append({"name": "current-startup-before-file-selection", "dom": startup})
+    page = _current_empty_page(session)
+    identity = _current_public_identity(session, page)
+    checks.append({"name": "current-public-identity", "identity": identity})
+    _current_empty_page(session)
+    fixture, summary = _new_fixture(output, run_id, "current", (17.0, 11.0, 7.0))
+    session[4]["stage"] = "current-once-only-file-selection"
+    supplied = _supply_product_file(session, fixture)
+    imported = _model(session, (17.0, 11.0, 7.0), fixture.name, CURRENT_RELEASE, "required")
+    if not _current_original_dimensions_match(imported):
+        raise ValueError("NATIVE_CURRENT_ORIGINAL_DIMENSIONS_MISMATCH:import")
+    if supplied.get("sha256") != summary["sha256"]:
+        raise ValueError("NATIVE_IMPORTED_FILE_IDENTITY_MISMATCH")
+    checks.append({"name": "current-normal-import", "supplied_file": supplied, "stl": summary, "dom": imported})
+    session[4]["stage"] = "current-import-images"
+    _current_stage_images(session, output, "imported-model", checks, images)
+    original_operation = _edit(session, (17.0, 11.0, 7.0), 12.0, 3.0, CURRENT_RELEASE, "required")
+    edited = _model(session, (20.0, 11.0, 7.0), fixture.name, CURRENT_RELEASE, "required")
+    if not _current_original_dimensions_match(edited):
+        raise ValueError("NATIVE_CURRENT_ORIGINAL_DIMENSIONS_MISMATCH:edit")
+    _settings(edited, 12.0, 3.0)
+    if edited.get("focused") != "target":
+        raise ValueError("NATIVE_TAB_ORDER_DID_NOT_REACH_TARGET")
+    checks.append({"name": "current-fixed-start-X-edit", "dom": edited, "original_operation": original_operation,
+                   "layout": _layout(session, ("#delta", "#target"))})
+    session[4]["stage"] = "current-edit-images"
+    _current_stage_images(session, output, "edited-model", checks, images)
+    _current_graphics(session, "before-current-camera-controls", checks)
+    checks.append({"name": "current-view-and-focus-controls", **_view_controls(session, output, images)})
+    _current_graphics(session, "after-current-camera-controls", checks)
+    final_model = _model(session, (20.0, 11.0, 7.0), fixture.name, CURRENT_RELEASE, "required")
+    if not _current_original_dimensions_match(final_model):
+        raise ValueError("NATIVE_CURRENT_ORIGINAL_DIMENSIONS_MISMATCH:final")
+    _settings(final_model, 12.0, 3.0)
+    if hashlib.sha256(fixture.read_bytes()).hexdigest() != summary["sha256"]:
+        raise ValueError("NATIVE_PRODUCT_FILE_BYTES_CHANGED")
+    checks.append({"name": "current-model-after-controls", "dom": final_model,
+                   "result_name": "current-public-native-import-edit-render",
+                   "remaining": "full-Safari-download-reopen-controls-and-stage-images"})
+
+
 def _source_hashes() -> list[dict[str, object]]:
     """Identify every actual source byte used by this run, excluding runtime output."""
     root = pathlib.Path(__file__).resolve().parents[1]
@@ -730,8 +938,8 @@ def _source_hashes() -> list[dict[str, object]]:
 
 
 def _prerequisites(output: pathlib.Path, run_id: str, phase: str, sources: list[dict[str, object]]) -> int:
-    """Require earlier successful phases from this exact run and eight-file revision."""
-    previous_phases = () if phase == "integration" else ("integration",) if phase == "guest" else ("integration", "guest")
+    """Require same-run guest/controls predecessors; current retains external transport."""
+    previous_phases = () if phase in ("integration", "current") else ("integration",) if phase == "guest" else ("integration", "guest")
     previous_image_bytes = 0
     for previous in previous_phases:
         path = output.parent / previous / "result.json"
@@ -911,7 +1119,7 @@ def main() -> int:
     output paths are refused so a repeated invocation cannot replay an operation.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("integration", "guest", "controls"))
+    parser.add_argument("phase", choices=("integration", "guest", "controls", "current"))
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--deadline-seconds", type=float, default=55.0)
@@ -966,6 +1174,8 @@ def main() -> int:
                 _launch((sys.executable, "-E", "-S", "-B", "-m", "http.server", str(server_port), "--bind", "127.0.0.1",
                          "--directory", str(output / "transport")), "static-server", resources, journal)
                 _integration(session, output, arguments.run_id, "http://127.0.0.1:" + str(server_port), checks, images)
+            elif arguments.phase == "current":
+                _current_product(session, output, arguments.run_id, checks, images)
             else:
                 _product(session, output, arguments.run_id, arguments.phase, checks, images)
         except Exception as error:
