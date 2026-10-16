@@ -243,17 +243,25 @@ def _supply_product_file(session: Session, path: pathlib.Path) -> dict[str, obje
     before_sha256 = hashlib.sha256(before).hexdigest()
     element = _element(session, "#file")
     operation_id = uuid.uuid4().hex
-    receipt = _command(session, "POST", "/element/" + element + "/value", {"text": str(path)},
-                       "select-product-file", operation_id)
+    supplied_file_cache: dict[str, object] = {
+        "path": str(path), "name": path.name, "byte_count": len(before), "before_sha256": before_sha256,
+        "command_receipt": {"operation_id": operation_id, "outcome": "unknown"}}
+    session[4]["supplied_file_cache"] = supplied_file_cache
+    command_started = time.monotonic()
+    try:
+        receipt = _command(session, "POST", "/element/" + element + "/value", {"text": str(path)},
+                           "select-product-file", operation_id)
+    finally:
+        supplied_file_cache["command_elapsed_seconds"] = time.monotonic() - command_started
     if receipt is not None:
         raise ValueError("NATIVE_PRODUCT_FILE_COMMAND_RECEIPT_INVALID")
+    supplied_file_cache["command_receipt"] = {"operation_id": operation_id, "outcome": "completed", "value": receipt}
     after = path.read_bytes()
     after_sha256 = hashlib.sha256(after).hexdigest()
+    supplied_file_cache.update({"after_sha256": after_sha256, "sha256": after_sha256, "byte_count": len(after)})
     if before != after or before_sha256 != after_sha256:
         raise ValueError("NATIVE_PRODUCT_FILE_BYTES_CHANGED")
-    return {"path": str(path), "name": path.name, "byte_count": len(after), "sha256": after_sha256,
-            "before_sha256": before_sha256, "after_sha256": after_sha256,
-            "command_receipt": {"operation_id": operation_id, "outcome": "completed", "value": receipt}}
+    return supplied_file_cache
 
 
 def _snapshot(session: Session) -> dict[str, object]:
@@ -288,19 +296,23 @@ def _dimensions(text: object) -> Point:
     return float(numbers[0]), float(numbers[1]), float(numbers[2])
 
 
-def _matches_model(observed: object, size_mm: Point) -> bool:
+def _matches_model(observed: object, size_mm: Point, expected_filename: str = "") -> bool:
+    """Match settled geometry, requiring the adopted source when one is specified."""
     snapshot = _object(observed, "NATIVE_DOM_OBSERVATION")
     try:
         size = _dimensions(snapshot.get("dimensions"))
     except ValueError:
         return False
     return (snapshot.get("editor") == "displayed" and snapshot.get("units") == "1"
+            and snapshot.get("load_progress") == "absent" and snapshot.get("load_error") == ""
+            and (not expected_filename or snapshot.get("filename") == expected_filename)
             and all(abs(size[axis] - size_mm[axis]) <= 0.0001 for axis in range(3)))
 
 
-def _model(session: Session, size_mm: Point) -> dict[str, object]:
-    """Wait for the actual public editor/dimensions and reject its displayed error."""
-    observed = _object(_poll(session[3], lambda: _snapshot(session), lambda value: _matches_model(value, size_mm),
+def _model(session: Session, size_mm: Point, expected_filename: str = "") -> dict[str, object]:
+    """Wait for settled public geometry/source and reject its displayed error."""
+    observed = _object(_poll(session[3], lambda: _snapshot(session),
+                             lambda value: _matches_model(value, size_mm, expected_filename),
                              "NATIVE_MODEL_DIMENSIONS_DEADLINE"), "NATIVE_DOM_OBSERVATION")
     if observed.get("release") != PUBLIC_RELEASE or observed.get("services") != "guest-beta":
         raise ValueError("NATIVE_PUBLIC_RELEASE_MISMATCH")
@@ -550,7 +562,7 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
     session[4]["stage"] = "first-product-file-selection"
     supplied = _supply_product_file(session, fixture)
     session[4]["stage"] = "first-model-dimensions-wait"
-    imported = _model(session, size)
+    imported = _model(session, size, fixture.name)
     if imported.get("filename") != fixture.name or supplied.get("sha256") != summary["sha256"]:
         raise ValueError("NATIVE_IMPORTED_FILE_IDENTITY_MISMATCH")
     checks.append({"name": "normal-import", "supplied_file": supplied, "stl": summary, "dom": imported, "webgl": _webgl(session)})
@@ -574,12 +586,15 @@ def _product(session: Session, output: pathlib.Path, run_id: str, phase: str, ch
         _click(session, "#download")
         downloaded, downloaded_summary = _await_download(session, downloads, run_id + "-guest", result_size)
         checks.append({"name": "one-product-download-complete-stl", "filename": downloaded.name, "stl": downloaded_summary})
+        session[4]["stage"] = "exact-downloaded-file-selection"
         reopened = _supply_product_file(session, downloaded)
-        reopened_model = _model(session, result_size)
+        session[4]["stage"] = "exact-downloaded-file-adoption-wait"
+        reopened_model = _model(session, result_size, downloaded.name)
         if (reopened.get("sha256") != downloaded_summary["sha256"]
                 or reopened_model.get("filename") != downloaded.name):
             raise ValueError("NATIVE_EXACT_DOWNLOADED_FILE_REOPEN_MISMATCH")
         checks.append({"name": "exact-downloaded-file-reopen", "supplied_file": reopened, "dom": reopened_model, "webgl": _webgl(session)})
+        session[4]["stage"] = "exact-downloaded-file-reopen-verified"
         _capture(session, output, "reopened-model", images)
     else:
         _type(session, "#delta", "-11")
