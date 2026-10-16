@@ -101,6 +101,35 @@ def test_png_capture_dimensions_require_complete_ihdr() -> None:
         _reject("NATIVE_SCREENSHOT_DIMENSIONS", lambda: _png_dimensions(damaged))
 
 
+def test_current_public_identity_requires_current_origin_release_and_bodies() -> None:
+    """Current metadata cannot rescue a wrong origin or different served runtime bytes."""
+    from qa.native_safari import _current_identity_matches
+
+    observed = {"origin": "https://part-stretch-app.netlify.app",
+                "release": "13aa60e02304d49b6e92bfc997ff027604b75c6f", "services": "required",
+                "manifest_product_commit": "13aa60e02304d49b6e92bfc997ff027604b75c6f",
+                "manifest_asset_source_commit": "13aa60e02304d49b6e92bfc997ff027604b75c6f",
+                "body_sha256": {
+                    "preview-release.json": "c878189c48e37d2f12893e2b4daebc32181cceda4ba5626ef2a8c894f76c7941",
+                    "app.js": "00bda7479576df48f98b8183ed6bff1893216bf0c92fd3e3cbe5cfaaaf79ece6",
+                    "viewer.js": "8a29738154aee3b2b193922b133ab79db91be8d227a9e7105c08a7f2e255dfc5"}}
+    assert _current_identity_matches(observed) is True
+    for field, wrong in (("origin", "https://part-stretch-free.pages.dev"),
+                         ("release", "9b0731642df08c879cbea912b6ff7daf3401a164"),
+                         ("services", "guest-beta"), ("manifest_product_commit", "79c9da3"),
+                         ("manifest_asset_source_commit", "79c9da3")):
+        assert _current_identity_matches({**observed, field: wrong}) is False
+        assert _current_identity_matches({key: value for key, value in observed.items() if key != field}) is False
+    body_hashes = observed["body_sha256"]
+    for path in ("preview-release.json", "app.js", "viewer.js"):
+        assert _current_identity_matches({**observed, "body_sha256": {**body_hashes, path: "0" * 64}}) is False
+        assert _current_identity_matches({**observed, "body_sha256": {
+            key: value for key, value in body_hashes.items() if key != path}}) is False
+    assert _current_identity_matches({key: value for key, value in observed.items() if key != "body_sha256"}) is False
+    assert _current_identity_matches(None) is False
+    assert observed["release"] == "13aa60e02304d49b6e92bfc997ff027604b75c6f"
+
+
 def test_camera_pair_requires_completed_same_canvas_images() -> None:
     """Only completed same-method/target/size captures can establish a changed pair."""
     from qa.native_safari import _camera_pair_changed
@@ -124,6 +153,20 @@ def test_camera_pair_requires_completed_same_canvas_images() -> None:
         assert _camera_pair_changed(before, missing) is False
         assert _camera_pair_changed(missing, after) is False
     assert before == original_before and after == original_after
+
+
+def test_current_model_retains_its_original_dimensions_after_edit() -> None:
+    """Edited dimensions cannot replace the separately observed original source size."""
+    from qa.native_safari import _current_original_dimensions_match
+
+    imported = {"dimensions": "17 x 11 x 7", "original_dimensions": "17 x 11 x 7"}
+    edited = {**imported, "dimensions": "20 x 11 x 7"}
+    assert _current_original_dimensions_match(imported) is True
+    assert _current_original_dimensions_match(edited) is True
+    for wrong in ("18 x 11 x 7", "20 x 11 x 7", "17 x 12 x 7", "17 x 11 x 8", "", None):
+        assert _current_original_dimensions_match({**edited, "original_dimensions": wrong}) is False
+    assert _current_original_dimensions_match({"dimensions": "20 x 11 x 7"}) is False
+    assert imported["original_dimensions"] == "17 x 11 x 7"
 
 
 def test_json_and_envelope_errors_cannot_become_success() -> None:
@@ -211,8 +254,10 @@ def main() -> int:
              test_product_startup_requires_complete_document_and_both_handlers,
              test_model_readiness_rejects_the_observed_loading_geometry,
              test_loaded_file_readiness_requires_its_exact_source_and_geometry,
+             test_current_public_identity_requires_current_origin_release_and_bodies,
              test_png_capture_dimensions_require_complete_ihdr,
              test_camera_pair_requires_completed_same_canvas_images,
+             test_current_model_retains_its_original_dimensions_after_edit,
              test_json_and_envelope_errors_cannot_become_success,
              test_remote_error_code_is_retained_without_raw_message,
              test_native_admission_requires_actual_host_and_session_fields,
