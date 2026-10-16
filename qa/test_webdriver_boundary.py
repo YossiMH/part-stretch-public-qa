@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import ast
+import copy
+import pathlib
+import re
 from collections.abc import Callable
 
 from qa.webdriver import (admit_native_session, latest_stable_safari_version,
@@ -266,6 +270,279 @@ def test_foreign_or_missing_receipts_cannot_authorize_replay() -> None:
         _reject("WRITE_OUTCOME", lambda: write_next_action("operation-1", "operation-1", outcome))
 
 
+def _draw_observation() -> dict[str, object]:
+    """Compact telemetry input only; it neither draws pixels nor emulates a browser.
+
+    Pixel coordinates use the default framebuffer's bottom-left origin. The
+    three interior foreground pixels occupy (1,1), (2,2), (3,3); the other 22
+    pixels match the opaque clear color. Bounds are inclusive pixel coordinates.
+    """
+    return {
+        "observer": "completed", "native_click": "completed", "record_count": 1,
+        "event": {"type": "click", "trust": "trusted", "target": "[data-view=fit]",
+                  "order": "document-bubble-after-target", "click_started_ms": 100.0,
+                  "event_timestamp_ms": 101.0, "observed_ms": 102.0, "click_completed_ms": 103.0},
+        "visibility": {
+            "document": "visible", "focus": "focused", "active_element": "button[data-view=fit]",
+            "canvas": {"display": "block", "visibility": "visible", "opacity": 1.0,
+                       "rectangle": [32.0, 100.0, 5.0, 5.0]},
+            "overlay": {"display": "none", "visibility": "hidden", "opacity": 0.0,
+                        "rectangle": [0.0, 0.0, 0.0, 0.0]},
+            "viewport": [1024.0, 716.0], "scroll": [0.0, 176.0]},
+        "gl": {
+            "context": "webgl2", "context_status": "healthy", "framebuffer": "default",
+            "context_attributes": {"alpha": False, "preserveDrawingBuffer": False},
+            "drawing_buffer": [5, 5], "viewport": [0, 0, 5, 5], "program_link": "linked",
+            "shader_logs": [{"type": "vertex", "status": "compiled", "log": ""},
+                            {"type": "fragment", "status": "compiled", "log": ""}],
+            "uniforms": {"eye": [0.0, 0.0, 30.0], "right": [1.0, 0.0, 0.0],
+                         "up": [0.0, 1.0, 0.0], "forward": [0.0, 0.0, -1.0],
+                         "scale": [1.0, 1.0], "planes": [0.1, 100.0]},
+            "position_buffer_bytes": 432},
+        "pixels": {
+            "readback": "completed", "error": "", "width": 5, "height": 5, "byte_length": 100,
+            "sentinel_rgba": [19, 37, 73, 109], "sentinel_unchanged_count": 0,
+            "zero_pixel_count": 0, "opaque_pixel_count": 25, "clear_rgba": [215, 215, 215, 255],
+            "clear_pixel_count": 22, "unique_color_count": 3, "foreground_count": 3,
+            "foreground_bounds": [1, 1, 3, 3],
+            "samples": [{"x": 0, "y": 0, "rgba": [215, 215, 215, 255]},
+                        {"x": 4, "y": 0, "rgba": [215, 215, 215, 255]},
+                        {"x": 0, "y": 4, "rgba": [215, 215, 215, 255]},
+                        {"x": 4, "y": 4, "rgba": [215, 215, 215, 255]},
+                        {"x": 2, "y": 2, "rgba": [224, 160, 91, 255]}]}}
+
+
+def _require_draw_class(observation: object, expected: str) -> None:
+    """Pixel telemetry cannot establish visible geometry, including on admission failure."""
+    from qa.native_safari import _classify_draw_observation
+
+    original = copy.deepcopy(observation)
+    result = _classify_draw_observation(observation)
+    assert result["pixel_class"] == expected, result
+    assert result["native_visible_model"] == "UNESTABLISHED", result
+    assert observation == original
+
+
+def test_draw_pixels_distinguish_clear_flat_and_bounded_raster_content() -> None:
+    """Varied bounded raster content says nothing about the native screenshot's model."""
+    observation = _draw_observation()
+    pixels = observation["pixels"]
+    assert isinstance(pixels, dict)
+    _require_draw_class(observation, "RASTER_CONTENT_OBSERVED")
+    clear_samples = [{**sample, "rgba": [215, 215, 215, 255]} for sample in pixels["samples"]]
+    clear = {**pixels, "clear_pixel_count": 25, "unique_color_count": 1,
+             "foreground_count": 0, "foreground_bounds": [], "samples": clear_samples}
+    _require_draw_class({**observation, "pixels": clear}, "CLEAR_ONLY")
+    flat = {**pixels, "clear_pixel_count": 0, "unique_color_count": 1,
+            "foreground_count": 25, "foreground_bounds": [0, 0, 4, 4],
+            "samples": [{**sample, "rgba": [224, 160, 91, 255]} for sample in pixels["samples"]]}
+    _require_draw_class({**observation, "pixels": flat}, "FLAT_UNCLASSIFIED")
+
+
+def test_draw_pixels_reject_unchanged_sentinel_zero_and_failed_readback() -> None:
+    """Silent readback failure cannot look like successful rasterization."""
+    observation = _draw_observation()
+    pixels = observation["pixels"]
+    assert isinstance(pixels, dict)
+    sentinel = {**pixels, "sentinel_unchanged_count": 25, "opaque_pixel_count": 0,
+                "clear_pixel_count": 0, "unique_color_count": 1, "foreground_count": 25,
+                "foreground_bounds": [0, 0, 4, 4],
+                "samples": [{**sample, "rgba": [19, 37, 73, 109]} for sample in pixels["samples"]]}
+    zero = {**sentinel, "sentinel_unchanged_count": 0, "zero_pixel_count": 25,
+            "samples": [{**sample, "rgba": [0, 0, 0, 0]} for sample in pixels["samples"]]}
+    for invalid in (sentinel, zero, {**pixels, "readback": "unknown"},
+                    {**pixels, "error": "SecurityError"}, {**pixels, "opaque_pixel_count": 24},
+                    {**pixels, "sentinel_unchanged_count": 1}):
+        _require_draw_class({**observation, "pixels": invalid}, "UNKNOWN")
+
+
+def test_draw_pixels_require_finite_bounded_consistent_summary() -> None:
+    """Malformed dimensions, counts, bounds and samples cannot qualify raster content."""
+    observation = _draw_observation()
+    pixels = observation["pixels"]
+    assert isinstance(pixels, dict)
+    for field, value in (("width", 0), ("height", -1), ("width", True), ("height", "5"),
+                         ("width", float("nan")), ("height", float("inf")),
+                         ("byte_length", 99), ("byte_length", 2097153),
+                         ("clear_pixel_count", 23), ("foreground_count", 26),
+                         ("unique_color_count", 0), ("unique_color_count", 26),
+                         ("foreground_bounds", [0, 1, 3, 3]),
+                         ("foreground_bounds", [3, 1, 1, 3]),
+                         ("foreground_bounds", [1, 1, 5, 3]),
+                         ("clear_rgba", [215, 215, 215, 0])):
+        _require_draw_class({**observation, "pixels": {**pixels, field: value}}, "UNKNOWN")
+    graphics = observation["gl"]
+    assert isinstance(graphics, dict)
+    for width, height, expected in ((1024, 512, "RASTER_CONTENT_OBSERVED"), (1024, 513, "UNKNOWN")):
+        bounded = {**pixels, "width": width, "height": height, "byte_length": width * height * 4,
+                   "opaque_pixel_count": width * height, "clear_pixel_count": width * height - 3,
+                   "samples": [{"x": x, "y": y, "rgba": [215, 215, 215, 255]}
+                               for x, y in ((0, 0), (width - 1, 0), (0, height - 1),
+                                            (width - 1, height - 1), (width // 2, height // 2))]}
+        _require_draw_class({**observation, "pixels": bounded,
+                             "gl": {**graphics, "drawing_buffer": [width, height],
+                                    "viewport": [0, 0, width, height]}}, expected)
+    samples = pixels["samples"]
+    for damaged in (samples[:-1], [samples[0]] * 5,
+                    [{**samples[0], "x": 5}, *samples[1:]],
+                    [{**samples[0], "rgba": [224, 160, 91, 255]}, *samples[1:]],
+                    [*samples[:-1], {**samples[-1], "rgba": [224, 160, 91, 254]}]):
+        _require_draw_class({**observation, "pixels": {**pixels, "samples": damaged}}, "UNKNOWN")
+    for field in pixels:
+        _require_draw_class({**observation, "pixels": {
+            key: value for key, value in pixels.items() if key != field}}, "UNKNOWN")
+
+
+def test_draw_observer_requires_one_completed_trusted_ordered_fit_event() -> None:
+    """Missing, duplicate, foreign or uncertain input records never authorize another click."""
+    observation = _draw_observation()
+    event = observation["event"]
+    assert isinstance(event, dict)
+    for field, value in (("observer", "absent"), ("observer", "unknown"),
+                         ("native_click", "unknown"), ("record_count", 0),
+                         ("record_count", 2), ("record_count", True)):
+        _require_draw_class({**observation, field: value}, "UNKNOWN")
+    for field, value in (("type", "pointerup"), ("trust", "untrusted"), ("target", "[data-view=top]"),
+                         ("order", "unknown"), ("observed_ms", 99.0),
+                         ("observed_ms", 100.5), ("observed_ms", 104.0),
+                         ("event_timestamp_ms", 99.0), ("event_timestamp_ms", 104.0),
+                         ("event_timestamp_ms", float("nan")),
+                         ("click_completed_ms", float("inf"))):
+        _require_draw_class({**observation, "event": {**event, field: value}}, "UNKNOWN")
+    for field in observation:
+        _require_draw_class({key: value for key, value in observation.items() if key != field}, "UNKNOWN")
+    for field in event:
+        _require_draw_class({**observation, "event": {
+            key: value for key, value in event.items() if key != field}}, "UNKNOWN")
+    for missing in (None, [], {}):
+        _require_draw_class(missing, "UNKNOWN")
+
+
+def test_draw_observation_requires_visible_admitted_canvas_and_existing_healthy_gl() -> None:
+    """Environment and incomplete GL observations stay unknown without repairing the page."""
+    observation = _draw_observation()
+    visibility, graphics = observation["visibility"], observation["gl"]
+    assert isinstance(visibility, dict) and isinstance(graphics, dict)
+    canvas = visibility["canvas"]
+    assert isinstance(canvas, dict)
+    for field, value in (("document", "hidden"), ("focus", "unfocused"),
+                         ("viewport", [0, 716]), ("scroll", [0, float("nan")])):
+        _require_draw_class({**observation, "visibility": {**visibility, field: value}}, "UNKNOWN")
+    for field, value in (("display", "none"), ("visibility", "hidden"), ("opacity", 0.0),
+                         ("rectangle", [32, 100, 0, 5]), ("rectangle", [32, 714, 5, 5])):
+        _require_draw_class({**observation, "visibility": {
+            **visibility, "canvas": {**canvas, field: value}}}, "UNKNOWN")
+    for field, value in (("context", "missing"), ("context_status", "lost"),
+                         ("framebuffer", "non-default"), ("program_link", "failed"),
+                         ("drawing_buffer", [5, 6]), ("viewport", [0, 0, 4, 5]),
+                         ("position_buffer_bytes", 0), ("position_buffer_bytes", float("nan")),
+                         ("context_attributes", {"alpha": True, "preserveDrawingBuffer": False})):
+        _require_draw_class({**observation, "gl": {**graphics, field: value}}, "UNKNOWN")
+    uniforms = graphics["uniforms"]
+    assert isinstance(uniforms, dict)
+    for field, value in (("eye", [0, 0, float("inf")]), ("right", [1, 0]),
+                         ("scale", [1.0]), ("scale", [float("nan"), 1.0]),
+                         ("scale", [1.0, float("inf")]), ("scale", 1.0),
+                         ("scale", float("nan")), ("planes", [0.1, float("inf")])):
+        _require_draw_class({**observation, "gl": {
+            **graphics, "uniforms": {**uniforms, field: value}}}, "UNKNOWN")
+    for section, record in (("visibility", visibility), ("gl", graphics)):
+        for field in record:
+            _require_draw_class({**observation, section: {
+                key: value for key, value in record.items() if key != field}}, "UNKNOWN")
+
+
+def test_diagnostic_captures_retain_originals_without_claiming_native_visible_model() -> None:
+    """Two completed native originals remain pending actual viewing; unknown remains unknown."""
+    from qa.native_safari import _diagnostic_capture_provenance
+
+    canvas = {"name": "draw-canvas", "capture_method": "element", "target": "#view",
+              "outcome": "completed", "command_outcome": "completed",
+              "png_width": 656, "png_height": 451, "png_bytes": 12000, "sha256": "0" * 64}
+    viewport = {**canvas, "capture_method": "viewport", "target": "viewport",
+                "png_width": 1024, "png_height": 716, "sha256": "1" * 64, "name": "draw-viewport"}
+    originals = [canvas, viewport]
+    before = copy.deepcopy(originals)
+    completed = _diagnostic_capture_provenance(originals)
+    assert completed["capture_status"] == "COMPLETED_ORIGINALS"
+    assert completed["native_visible_model"] == "UNESTABLISHED"
+    assert completed["originals"] == originals
+    for images in ([], [canvas], [canvas, canvas], [viewport, canvas, viewport],
+                   [canvas, {**viewport, "outcome": "unknown"}],
+                   [canvas, {**viewport, "command_outcome": "unknown"}],
+                   [canvas, {"name": "draw-viewport", "capture_method": "viewport", "target": "viewport",
+                             "outcome": "unknown", "command_outcome": "unknown"}],
+                   [{**canvas, "outcome": "unsupported"}, viewport],
+                   [{**canvas, "capture_method": "readPixels"}, viewport],
+                   [{**canvas, "target": "#editor"}, viewport],
+                   [canvas, {**viewport, "png_bytes": 262145}],
+                   [canvas, {**viewport, "png_width": 0}],
+                   [canvas, {**viewport, "sha256": ""}],
+                   [canvas, {**viewport, "name": "draw-canvas"}],
+                   [canvas, {key: value for key, value in viewport.items() if key != "outcome"}]):
+        retained = copy.deepcopy(images)
+        result = _diagnostic_capture_provenance(images)
+        assert result["capture_status"] == "UNKNOWN", result
+        assert result["native_visible_model"] == "UNESTABLISHED", result
+        assert result["originals"] == images
+        assert images == retained
+    assert originals == before
+
+
+def test_native_phase_contract_preserves_full_current_and_legacy_predecessors() -> None:
+    """One phase contract owns handler, predecessors, result name and diagnostic limits."""
+    from qa import native_safari
+
+    current = native_safari._phase_contract("current")
+    assert current["handler"] is native_safari._current_diagnostic
+    assert current["previous_phases"] == ()
+    assert current["result_name"] == "current-public-native-draw-diagnostic"
+    assert current["image_limit"] == 2
+    assert current["edit_policy"] == "forbidden"
+    full = native_safari._phase_contract("full-current")
+    assert full["handler"] is native_safari._current_product
+    assert full["previous_phases"] == ()
+    assert full["result_name"] == "current-public-native-import-edit-render"
+    assert full["edit_policy"] == "existing-import-edit-camera"
+    for phase, handler, predecessors in (("integration", native_safari._integration, ()),
+                                         ("guest", native_safari._product, ("integration",)),
+                                         ("controls", native_safari._product, ("integration", "guest"))):
+        contract = native_safari._phase_contract(phase)
+        assert contract["handler"] is handler
+        assert contract["previous_phases"] == predecessors
+    no_results = pathlib.Path(__file__).resolve().parent / "no-same-run-predecessor-needed"
+    for phase in ("current", "full-current"):
+        assert native_safari._prerequisites(no_results, "pure-phase-contract", phase, []) == 0
+    _reject("NATIVE_PHASE_UNKNOWN", lambda: native_safari._phase_contract("future-current"))
+
+
+def test_real_unchanged_yaml_selects_diagnostic_in_actual_parser_contract() -> None:
+    """Read the real literal invoker; no YAML dependency or second phase table is needed."""
+    from qa import native_safari
+
+    workflow = (pathlib.Path(__file__).resolve().parents[1] / "codemagic.yaml").read_text(encoding="utf-8")
+    loops = re.findall(r'^\s*for phase in (\([^\n]+\)):\s*$', workflow, re.MULTILINE)
+    assert len(loops) == 1, loops
+    selected = ast.literal_eval(loops[0])
+    assert selected == ("current",), selected
+    assert '"-m", "qa.native_safari", phase' in workflow
+    assert '"--deadline-seconds", "55"' in workflow
+    parser = native_safari._argument_parser()
+    arguments = parser.parse_args([selected[0], "--output", ".qa-runs/pure-phase/current",
+                                   "--run-id", "pure-phase", "--deadline-seconds", "55"])
+    contract = native_safari._phase_contract(arguments.phase)
+    assert arguments.phase == "current"
+    assert contract["handler"] is native_safari._current_diagnostic
+    assert contract["result_name"] == "current-public-native-draw-diagnostic"
+    assert contract["image_limit"] == 2 and contract["edit_policy"] == "forbidden"
+    for phase in ("integration", "guest", "controls", "full-current"):
+        parsed = parser.parse_args([phase, "--output", ".qa-runs/pure-phase/" + phase,
+                                    "--run-id", "pure-phase"])
+        assert parsed.phase == phase
+    help_text = parser.format_help()
+    assert "full-current" in help_text and "current" in help_text
+
+
 def main() -> int:
     """Execute pure cases without a browser or service; every unexpected result fails."""
     tests = (test_response_value_is_preserved_without_coercion,
@@ -284,7 +561,15 @@ def main() -> int:
              test_current_safari_release_includes_whole_major_labels,
              test_current_safari_version_normalizes_only_equivalent_trailing_zeros,
              test_only_known_unexecuted_writes_can_be_dispatched,
-             test_foreign_or_missing_receipts_cannot_authorize_replay)
+             test_foreign_or_missing_receipts_cannot_authorize_replay,
+             test_draw_pixels_distinguish_clear_flat_and_bounded_raster_content,
+             test_draw_pixels_reject_unchanged_sentinel_zero_and_failed_readback,
+             test_draw_pixels_require_finite_bounded_consistent_summary,
+             test_draw_observer_requires_one_completed_trusted_ordered_fit_event,
+             test_draw_observation_requires_visible_admitted_canvas_and_existing_healthy_gl,
+             test_diagnostic_captures_retain_originals_without_claiming_native_visible_model,
+             test_native_phase_contract_preserves_full_current_and_legacy_predecessors,
+             test_real_unchanged_yaml_selects_diagnostic_in_actual_parser_contract)
     failures: list[str] = []
     for test in tests:
         try:
