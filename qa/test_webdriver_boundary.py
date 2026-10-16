@@ -85,6 +85,47 @@ def test_loaded_file_readiness_requires_its_exact_source_and_geometry() -> None:
     assert observed["filename"] == "qa-native-guest.stl"
 
 
+def test_png_capture_dimensions_require_complete_ihdr() -> None:
+    """Header dimensions describe the captured PNG, not a reported DOM rectangle."""
+    from qa.native_safari import _png_dimensions
+
+    header = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + (320).to_bytes(4, "big")
+              + (240).to_bytes(4, "big") + b"\x08\x06\x00\x00\x00\x00\x00\x00\x00")
+    assert _png_dimensions(header) == (320, 240)
+    _reject("NATIVE_SCREENSHOT_NOT_PNG", lambda: _png_dimensions(b"not a PNG"))
+    for damaged in (header[:-1], header[:8], header[:8] + b"\x00\x00\x00\x0c" + header[12:],
+                    header[:12] + b"IDAT" + header[16:]):
+        _reject("NATIVE_SCREENSHOT_HEADER", lambda: _png_dimensions(damaged))
+    for width, height in ((0, 240), (320, 0), (0x80000000, 240), (320, 0x80000000)):
+        damaged = header[:16] + width.to_bytes(4, "big") + height.to_bytes(4, "big") + header[24:]
+        _reject("NATIVE_SCREENSHOT_DIMENSIONS", lambda: _png_dimensions(damaged))
+
+
+def test_camera_pair_requires_completed_same_canvas_images() -> None:
+    """Only completed same-method/target/size captures can establish a changed pair."""
+    from qa.native_safari import _camera_pair_changed
+
+    before = {"capture_method": "element", "target": "#view", "outcome": "completed",
+              "png_width": 656, "png_height": 451, "sha256": "0" * 64}
+    after = {**before, "sha256": "1" * 64}
+    original_before, original_after = dict(before), dict(after)
+    assert _camera_pair_changed(before, after) is True
+    assert _camera_pair_changed(before, before) is False
+    for field, value in (("capture_method", "viewport"), ("target", "#editor"),
+                         ("outcome", "unsupported"), ("outcome", "unknown"),
+                         ("png_width", 657), ("png_height", 452), ("png_width", 0),
+                         ("png_height", -1), ("png_width", True), ("png_height", "451"),
+                         ("sha256", ""), ("sha256", "not-a-hash")):
+        assert _camera_pair_changed(before, {**after, field: value}) is False
+        assert _camera_pair_changed({**before, field: value}, after) is False
+    for field in before:
+        assert _camera_pair_changed(before, {key: value for key, value in after.items() if key != field}) is False
+    for missing in (None, [], {}):
+        assert _camera_pair_changed(before, missing) is False
+        assert _camera_pair_changed(missing, after) is False
+    assert before == original_before and after == original_after
+
+
 def test_json_and_envelope_errors_cannot_become_success() -> None:
     """Malformed bytes, absent values and failed HTTP responses cannot admit a command."""
     for body in (b'not json', b'{"value":null} trailing', b'{"value":"\xff"}',
@@ -170,6 +211,8 @@ def main() -> int:
              test_product_startup_requires_complete_document_and_both_handlers,
              test_model_readiness_rejects_the_observed_loading_geometry,
              test_loaded_file_readiness_requires_its_exact_source_and_geometry,
+             test_png_capture_dimensions_require_complete_ihdr,
+             test_camera_pair_requires_completed_same_canvas_images,
              test_json_and_envelope_errors_cannot_become_success,
              test_remote_error_code_is_retained_without_raw_message,
              test_native_admission_requires_actual_host_and_session_fields,
