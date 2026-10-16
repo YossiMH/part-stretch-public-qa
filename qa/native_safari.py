@@ -52,6 +52,8 @@ CURRENT_BODY_BYTE_LIMIT = 256 * 1024
 APPLE_RELEASES_URL = "https://support.apple.com/en-us/100100"
 PNG_BYTE_LIMIT = 256 * 1024
 IMAGE_LOG_BYTE_LIMIT = 1024 * 1024
+# One same-task default-framebuffer read, never a replacement native image.
+DRAW_READBACK_BYTE_LIMIT = 2 * 1024 * 1024
 SOURCE_PATHS = ("codemagic.yaml", "qa/test-plan.md", "qa/test_stl.py", "qa/test_webdriver_boundary.py",
                 "qa/stl.py", "qa/webdriver.py", "qa/native_safari.py", "qa/file-controls.html")
 ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
@@ -1007,6 +1009,412 @@ def _current_product(session: Session, output: pathlib.Path, run_id: str, checks
                    "remaining": "full-Safari-download-reopen-controls-and-stage-images"})
 
 
+def _draw_vector(value: object, length: int) -> list[float]:
+    if not isinstance(value, list) or len(value) != length:
+        raise ValueError("NATIVE_DRAW_VECTOR")
+    return [_number(component, "NATIVE_DRAW_VECTOR") for component in value]
+
+
+def _draw_integer(value: object, minimum: int, maximum: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+        raise ValueError("NATIVE_DRAW_INTEGER")
+    return value
+
+
+def _draw_style(value: object) -> dict[str, object]:
+    style = _object(value, "NATIVE_DRAW_STYLE")
+    for field in ("display", "visibility"):
+        _string(style.get(field), "NATIVE_DRAW_STYLE")
+    opacity = _number(style.get("opacity"), "NATIVE_DRAW_STYLE")
+    rectangle = _draw_vector(style.get("rectangle"), 4)
+    if not 0 <= opacity <= 1 or min(rectangle[2:]) < 0:
+        raise ValueError("NATIVE_DRAW_STYLE")
+    return style
+
+
+def _draw_pixel_class(observation: dict[str, object]) -> str:
+    """Validate compact bottom-left-origin RGBA telemetry without inferring visibility."""
+    if (observation.get("observer") != "completed" or observation.get("native_click") != "completed"
+            or _draw_integer(observation.get("record_count"), 1, 1) != 1):
+        raise ValueError("NATIVE_DRAW_EVENT")
+    event = _object(observation.get("event"), "NATIVE_DRAW_EVENT")
+    if any(event.get(field) != expected for field, expected in (
+            ("type", "click"), ("trust", "trusted"), ("target", "[data-view=fit]"),
+            ("order", "document-bubble-after-target"))):
+        raise ValueError("NATIVE_DRAW_EVENT")
+    started, timestamp, observed, completed = (
+        _number(event.get(field), "NATIVE_DRAW_EVENT") for field in
+        ("click_started_ms", "event_timestamp_ms", "observed_ms", "click_completed_ms"))
+    if not 0 <= started <= timestamp <= observed <= completed:
+        raise ValueError("NATIVE_DRAW_EVENT")
+    visibility = _object(observation.get("visibility"), "NATIVE_DRAW_VISIBILITY")
+    if visibility.get("document") != "visible" or visibility.get("focus") != "focused":
+        raise ValueError("NATIVE_DRAW_VISIBILITY")
+    _string(visibility.get("active_element"), "NATIVE_DRAW_VISIBILITY")
+    viewport_width, viewport_height = _draw_vector(visibility.get("viewport"), 2)
+    _draw_vector(visibility.get("scroll"), 2)
+    canvas = _draw_style(visibility.get("canvas"))
+    _draw_style(visibility.get("overlay"))
+    left, top, css_width, css_height = _draw_vector(canvas.get("rectangle"), 4)
+    if (canvas.get("display") == "none" or canvas.get("visibility") != "visible"
+            or canvas.get("opacity") != 1 or min(css_width, css_height) <= 0
+            or min(left, top) < 0 or left + css_width > viewport_width
+            or top + css_height > viewport_height):
+        raise ValueError("NATIVE_DRAW_VISIBILITY")
+    graphics = _object(observation.get("gl"), "NATIVE_DRAW_GL")
+    if any(graphics.get(field) != expected for field, expected in (
+            ("context", "webgl2"), ("context_status", "healthy"),
+            ("framebuffer", "default"), ("program_link", "linked"))):
+        raise ValueError("NATIVE_DRAW_GL")
+    attributes = _object(graphics.get("context_attributes"), "NATIVE_DRAW_GL")
+    if attributes.get("alpha") is not False or attributes.get("preserveDrawingBuffer") is not False:
+        raise ValueError("NATIVE_DRAW_GL")
+    shader_logs = graphics.get("shader_logs")
+    if (not isinstance(shader_logs, list) or len(shader_logs) != 2
+            or { _object(shader, "NATIVE_DRAW_GL").get("type") for shader in shader_logs }
+            != {"vertex", "fragment"}):
+        raise ValueError("NATIVE_DRAW_GL")
+    for shader in shader_logs:
+        if shader.get("status") != "compiled" or not isinstance(shader.get("log"), str):
+            raise ValueError("NATIVE_DRAW_GL")
+    uniforms = _object(graphics.get("uniforms"), "NATIVE_DRAW_GL")
+    for name, length in (("eye", 3), ("right", 3), ("up", 3), ("forward", 3), ("scale", 2), ("planes", 2)):
+        _draw_vector(uniforms.get(name), length)
+    if min(_draw_vector(uniforms.get("scale"), 2)) <= 0:
+        raise ValueError("NATIVE_DRAW_GL")
+    buffer_bytes = _draw_integer(graphics.get("position_buffer_bytes"), 36, 0x7fffffff)
+    if buffer_bytes % 36:
+        raise ValueError("NATIVE_DRAW_GL")
+    pixels = _object(observation.get("pixels"), "NATIVE_DRAW_PIXELS")
+    if pixels.get("readback") != "completed" or pixels.get("error") != "":
+        raise ValueError("NATIVE_DRAW_PIXELS")
+    width = _draw_integer(pixels.get("width"), 1, DRAW_READBACK_BYTE_LIMIT // 4)
+    height = _draw_integer(pixels.get("height"), 1, DRAW_READBACK_BYTE_LIMIT // 4)
+    pixel_count = width * height
+    if (_draw_integer(pixels.get("byte_length"), 4, DRAW_READBACK_BYTE_LIMIT) != pixel_count * 4
+            or _draw_vector(graphics.get("drawing_buffer"), 2) != [width, height]
+            or _draw_vector(graphics.get("viewport"), 4) != [0, 0, width, height]):
+        raise ValueError("NATIVE_DRAW_PIXELS")
+    sentinel = _draw_vector(pixels.get("sentinel_rgba"), 4)
+    clear = _draw_vector(pixels.get("clear_rgba"), 4)
+    if sentinel != [19, 37, 73, 109] or clear[3] != 255:
+        raise ValueError("NATIVE_DRAW_PIXELS")
+    for component in clear:
+        if not component.is_integer() or not 0 <= component <= 255:
+            raise ValueError("NATIVE_DRAW_PIXELS")
+    for field in ("sentinel_unchanged_count", "zero_pixel_count"):
+        if _draw_integer(pixels.get(field), 0, pixel_count) != 0:
+            raise ValueError("NATIVE_DRAW_PIXELS")
+    if _draw_integer(pixels.get("opaque_pixel_count"), 0, pixel_count) != pixel_count:
+        raise ValueError("NATIVE_DRAW_PIXELS")
+    clear_count = _draw_integer(pixels.get("clear_pixel_count"), 0, pixel_count)
+    foreground_count = _draw_integer(pixels.get("foreground_count"), 0, pixel_count)
+    unique_count = _draw_integer(pixels.get("unique_color_count"), 1, pixel_count)
+    if clear_count + foreground_count != pixel_count:
+        raise ValueError("NATIVE_DRAW_PIXELS")
+    bounds = pixels.get("foreground_bounds")
+    if foreground_count:
+        min_x, min_y, max_x, max_y = _draw_vector(bounds, 4)
+        if (any(not coordinate.is_integer() for coordinate in (min_x, min_y, max_x, max_y))
+                or not 0 <= min_x <= max_x < width or not 0 <= min_y <= max_y < height
+                or foreground_count > (max_x - min_x + 1) * (max_y - min_y + 1)):
+            raise ValueError("NATIVE_DRAW_PIXELS")
+    elif bounds != []:
+        raise ValueError("NATIVE_DRAW_PIXELS")
+    sample_positions = ((0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1),
+                        (width // 2, height // 2))
+    samples = pixels.get("samples")
+    if not isinstance(samples, list) or len(samples) != 5:
+        raise ValueError("NATIVE_DRAW_PIXELS")
+    sampled_colors: set[tuple[float, ...]] = set()
+    for sample, (expected_x, expected_y) in zip(samples, sample_positions):
+        sample = _object(sample, "NATIVE_DRAW_PIXELS")
+        if (sample.get("x") != expected_x or sample.get("y") != expected_y
+                or isinstance(sample.get("x"), bool) or isinstance(sample.get("y"), bool)):
+            raise ValueError("NATIVE_DRAW_PIXELS")
+        rgba = _draw_vector(sample.get("rgba"), 4)
+        if rgba[3] != 255 or any(not component.is_integer() or not 0 <= component <= 255 for component in rgba):
+            raise ValueError("NATIVE_DRAW_PIXELS")
+        sampled_colors.add(tuple(rgba))
+        if rgba != clear and (not foreground_count or not min_x <= expected_x <= max_x
+                              or not min_y <= expected_y <= max_y):
+            raise ValueError("NATIVE_DRAW_PIXELS")
+        if clear_count == pixel_count and rgba != clear or clear_count == 0 and rgba == clear:
+            raise ValueError("NATIVE_DRAW_PIXELS")
+    if len(sampled_colors) > unique_count:
+        raise ValueError("NATIVE_DRAW_PIXELS")
+    if clear_count == pixel_count:
+        if unique_count != 1:
+            raise ValueError("NATIVE_DRAW_PIXELS")
+        return "CLEAR_ONLY"
+    if unique_count == 1:
+        if clear_count != 0 or bounds != [0, 0, width - 1, height - 1]:
+            raise ValueError("NATIVE_DRAW_PIXELS")
+        return "FLAT_UNCLASSIFIED"
+    if (0 < foreground_count < pixel_count and unique_count <= foreground_count + 1
+            and 0 < min_x <= max_x < width - 1 and 0 < min_y <= max_y < height - 1
+            and all(sample["rgba"] == clear for sample in samples[:4])):
+        return "RASTER_CONTENT_OBSERVED"
+    return "UNKNOWN"
+
+
+def _classify_draw_observation(value: object) -> dict[str, object]:
+    """Return a conservative pixel class; native originals always need actual viewing."""
+    try:
+        pixel_class = _draw_pixel_class(_object(value, "NATIVE_DRAW_OBSERVATION"))
+    except (ValueError, TypeError, KeyError):
+        pixel_class = "UNKNOWN"
+    return {"pixel_class": pixel_class, "native_visible_model": "UNESTABLISHED"}
+
+
+def _diagnostic_capture_provenance(value: object) -> dict[str, object]:
+    """Accept only the two completed native originals, without classifying their pixels."""
+    status = "UNKNOWN"
+    try:
+        if not isinstance(value, list) or len(value) != 2:
+            raise ValueError("NATIVE_DRAW_ORIGINALS")
+        for image, name, method, target in zip(value, ("draw-canvas", "draw-viewport"),
+                                              ("element", "viewport"), ("#view", "viewport")):
+            image = _object(image, "NATIVE_DRAW_ORIGINALS")
+            if any(image.get(field) != expected for field, expected in (
+                    ("name", name), ("capture_method", method), ("target", target),
+                    ("outcome", "completed"), ("command_outcome", "completed"))):
+                raise ValueError("NATIVE_DRAW_ORIGINALS")
+            for field in ("png_width", "png_height"):
+                _draw_integer(image.get(field), 1, 0x7fffffff)
+            _draw_integer(image.get("png_bytes"), 1, PNG_BYTE_LIMIT)
+            if re.fullmatch(r"[0-9a-f]{64}", _string(image.get("sha256"), "NATIVE_DRAW_ORIGINALS")) is None:
+                raise ValueError("NATIVE_DRAW_ORIGINALS")
+        status = "COMPLETED_ORIGINALS"
+    except (ValueError, TypeError):
+        pass
+    return {"capture_status": status, "native_visible_model": "UNESTABLISHED", "originals": value}
+
+
+def _draw_observer_command(session: Session, script: str, arguments: tuple[object, ...], name: str) -> object:
+    """Own observer script effects once; uncertainty requires session termination, not replay."""
+    try:
+        return _command(session, "POST", "/execute/sync", {"script": script, "args": arguments}, name)
+    except Exception as error:
+        if not _failure_code(error).startswith("WEBDRIVER_REMOTE_ERROR:"):
+            session[4]["draw_observer_transport"] = "unknown"
+        raise
+
+
+def _remove_draw_observer(session: Session, key: str) -> None:
+    """Remove exactly this phase's listener/queue once; unknown transport uses session cleanup."""
+    if session[4].get("draw_observer_transport") == "unknown":
+        session[4]["draw_observer_cleanup"] = "uncertain-session-termination-required"
+        return
+    session[4]["draw_observer_cleanup"] = "unknown"
+    receipt = _draw_observer_command(session, """
+const key=arguments[0],queue=window[key];
+if(!queue)return 'absent';
+document.removeEventListener('click',queue.listener,false);
+delete window[key];return 'removed';
+""", (key,), "remove-draw-observer")
+    if receipt not in ("removed", "absent"):
+        raise ValueError("NATIVE_DRAW_OBSERVER_CLEANUP")
+    session[4]["draw_observer_cleanup"] = receipt
+
+
+def _observe_fit_draw(session: Session) -> dict[str, object]:
+    """Observe one trusted Fit draw in the target's synchronous bubbling event task.
+
+    Exact app/viewer body hashes admit the known synchronous target handler. The
+    narrowly permitted callback owns only bounded test telemetry. DOM timestamps
+    all use performance's origin; no Python/UTC clock enters event ordering.
+    """
+    fit_element = _element(session, "[data-view=fit]")
+    key = "__public_qa_fit_draw_" + uuid.uuid4().hex
+    session[4]["draw_observer_cleanup"] = "pending"
+    try:
+        receipt = _draw_observer_command(session, """
+const key=arguments[0],fit=arguments[1],limit=arguments[2];
+const canvas=document.getElementById('view'),overlay=document.getElementById('overlay');
+if(window[key]||!canvas||!overlay||fit!==document.querySelector('[data-view=fit]')
+ ||typeof fit.onclick!=='function')return 'admission-failed';
+const gl=canvas.getContext('webgl2'),width=gl?.drawingBufferWidth,height=gl?.drawingBufferHeight;
+if(!gl||gl.isContextLost()||!Number.isSafeInteger(width)||!Number.isSafeInteger(height)
+ ||width<=0||height<=0||width*height*4>limit)return 'admission-failed';
+const destination=new Uint8Array(width*height*4),colors=new Uint32Array(width*height);
+const sentinel=[19,37,73,109],targetHandler=fit.onclick;
+for(let offset=0;offset<destination.length;offset+=4)destination.set(sentinel,offset);
+const rectangle=element=>{const r=element.getBoundingClientRect();return [r.left,r.top,r.width,r.height];};
+const style=element=>{const s=getComputedStyle(element);return {display:s.display,visibility:s.visibility,
+ opacity:Number(s.opacity),rectangle:rectangle(element)};};
+const queue={records:[],listener:null,click_started_ms:performance.now()};
+function observeFitDraw(event){
+ if(!event.isTrusted||event.type!=='click'||!(event.target instanceof Element)
+  ||event.target.closest('[data-view=fit]')!==fit)return;
+ if(queue.records.length>=2)return;
+ const observed_ms=performance.now();
+ if(queue.records.length){queue.records.push(Object.freeze({error:'duplicate-event'}));return;}
+ try{
+  const visibility={document:document.visibilityState,focus:document.hasFocus()?'focused':'unfocused',
+   active_element:document.activeElement===fit?'button[data-view=fit]':document.activeElement?.tagName||'absent',
+   canvas:style(canvas),overlay:style(overlay),viewport:[innerWidth,innerHeight],scroll:[scrollX,scrollY]};
+  const program=gl.getParameter(gl.CURRENT_PROGRAM),framebuffer=gl.getParameter(gl.FRAMEBUFFER_BINDING);
+  const readFramebuffer=gl.getParameter(gl.READ_FRAMEBUFFER_BINDING),readBuffer=gl.getParameter(gl.READ_BUFFER);
+  const shaders=program?gl.getAttachedShaders(program):[];
+  const uniforms={};for(const name of ['eye','right','up','forward','scale','planes']){
+   const location=program?gl.getUniformLocation(program,name):null;
+   const value=location===null?null:gl.getUniform(program,location);
+   uniforms[name]=value===null?null:Array.from(value);
+  }
+  const attribute=program?gl.getAttribLocation(program,'position'):-1;
+  const attributeBuffer=attribute<0?null:gl.getVertexAttrib(attribute,gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING);
+  const graphics={context:'webgl2',context_status:gl.isContextLost()?'lost':'healthy',
+   framebuffer:framebuffer===null&&readFramebuffer===null&&readBuffer===gl.BACK?'default':'non-default',
+   context_attributes:gl.getContextAttributes(),
+   drawing_buffer:[gl.drawingBufferWidth,gl.drawingBufferHeight],viewport:Array.from(gl.getParameter(gl.VIEWPORT)),
+   program_link:program&&gl.getProgramParameter(program,gl.LINK_STATUS)?'linked':'failed',
+   program_log:program?gl.getProgramInfoLog(program):'',
+   shader_logs:(shaders||[]).map(shader=>({type:gl.getShaderParameter(shader,gl.SHADER_TYPE)===gl.VERTEX_SHADER?'vertex':'fragment',
+    status:gl.getShaderParameter(shader,gl.COMPILE_STATUS)?'compiled':'failed',log:gl.getShaderInfoLog(shader)||''})),
+   uniforms,position_buffer_bytes:attributeBuffer&&attributeBuffer===gl.getParameter(gl.ARRAY_BUFFER_BINDING)
+    ?gl.getBufferParameter(gl.ARRAY_BUFFER,gl.BUFFER_SIZE):null};
+  const clear=Array.from(gl.getParameter(gl.COLOR_CLEAR_VALUE),component=>Math.round(component*255));
+  const pixels={readback:'not-admitted',error:'',width,height,byte_length:destination.length,
+   sentinel_rgba:sentinel,sentinel_unchanged_count:0,zero_pixel_count:0,opaque_pixel_count:0,
+   clear_rgba:clear,clear_pixel_count:0,unique_color_count:0,foreground_count:0,foreground_bounds:[],samples:[]};
+  if(graphics.framebuffer==='default'&&width===gl.drawingBufferWidth&&height===gl.drawingBufferHeight){
+   gl.readPixels(0,0,width,height,gl.RGBA,gl.UNSIGNED_BYTE,destination);pixels.readback='completed';
+   let minX=width,minY=height,maxX=-1,maxY=-1;
+   for(let offset=0,index=0;offset<destination.length;offset+=4,index++){
+    const r=destination[offset],g=destination[offset+1],b=destination[offset+2],a=destination[offset+3];
+    colors[index]=((r*256+g)*256+b)*256+a;
+    if(r===19&&g===37&&b===73&&a===109)pixels.sentinel_unchanged_count++;
+    if(r===0&&g===0&&b===0&&a===0)pixels.zero_pixel_count++;
+    if(a===255)pixels.opaque_pixel_count++;
+    if(r===clear[0]&&g===clear[1]&&b===clear[2]&&a===clear[3])pixels.clear_pixel_count++;
+    else{pixels.foreground_count++;const x=index%width,y=Math.floor(index/width);
+     minX=Math.min(minX,x);minY=Math.min(minY,y);maxX=Math.max(maxX,x);maxY=Math.max(maxY,y);}
+   }
+   colors.sort();for(let index=0;index<colors.length;index++)if(index===0||colors[index]!==colors[index-1])pixels.unique_color_count++;
+   if(pixels.foreground_count)pixels.foreground_bounds=[minX,minY,maxX,maxY];
+   for(const [x,y] of [[0,0],[width-1,0],[0,height-1],[width-1,height-1],[Math.floor(width/2),Math.floor(height/2)]]){
+    const offset=(y*width+x)*4;pixels.samples.push({x,y,rgba:Array.from(destination.subarray(offset,offset+4))});
+   }
+  }
+  queue.records.push(Object.freeze({event:{type:event.type,trust:'trusted',target:'[data-view=fit]',
+   order:event.eventPhase===Event.BUBBLING_PHASE&&event.currentTarget===document&&fit.onclick===targetHandler
+    ?'document-bubble-after-target':'unknown',click_started_ms:queue.click_started_ms,
+   event_timestamp_ms:event.timeStamp,observed_ms},visibility,gl:graphics,pixels}));
+ }catch(error){queue.records.push(Object.freeze({error:error instanceof Error?error.name:'readback-error'}));}
+}
+queue.listener=observeFitDraw;window[key]=queue;
+document.addEventListener('click',observeFitDraw,false);return 'installed';
+""", (key, {ELEMENT_KEY: fit_element}, DRAW_READBACK_BYTE_LIMIT), "install-draw-observer")
+        if receipt != "installed":
+            raise ValueError("NATIVE_DRAW_OBSERVER_ADMISSION")
+        try:
+            click_receipt = _command(session, "POST", "/element/" + fit_element + "/click", {}, "diagnostic-once-only-fit")
+        except Exception as error:
+            if not _failure_code(error).startswith("WEBDRIVER_REMOTE_ERROR:"):
+                session[4]["draw_observer_transport"] = "unknown"
+            raise
+        if click_receipt is not None:
+            raise ValueError("NATIVE_DRAW_CLICK_RECEIPT")
+        observed = _object(_draw_observer_command(session, """
+const queue=window[arguments[0]],completed=performance.now();
+if(!queue)return {observer:'absent',native_click:'completed',record_count:0};
+const records=queue.records.splice(0),record=records.length===1?records[0]:{};
+return {...record,observer:'completed',native_click:'completed',record_count:records.length,
+ event:record.event?{...record.event,click_completed_ms:completed}:null};
+""", (key,), "collect-draw-observer"), "NATIVE_DRAW_OBSERVER_RESULT")
+        session[4]["draw_observation_cache"] = observed
+        return observed
+    finally:
+        body_error = sys.exc_info()[1]
+        try:
+            _remove_draw_observer(session, key)
+        except Exception as cleanup_error:
+            session[4]["draw_observer_cleanup_code"] = _failure_code(cleanup_error)
+            if body_error is None:
+                raise
+
+
+def _current_diagnostic(session: Session, output: pathlib.Path, run_id: str, checks: Checks, images: Images) -> None:
+    """Import once, observe one real Fit draw, then retain exactly two native originals."""
+    session[4]["stage"] = "current-diagnostic-navigation"
+    _command(session, "POST", "/url", {"url": CURRENT_ORIGIN + "/"}, "open-current-public")
+    startup = _object(_poll(session[3], lambda: _snapshot(session), product_startup_ready,
+                            "NATIVE_PUBLIC_STARTUP_DEADLINE"), "NATIVE_DOM_OBSERVATION")
+    checks.append({"name": "diagnostic-startup-before-file-selection", "dom": startup})
+    identity = _current_public_identity(session, _current_empty_page(session))
+    checks.append({"name": "diagnostic-public-identity-and-synchronous-fit-source", "identity": identity})
+    _current_empty_page(session)
+    fixture, summary = _new_fixture(output, run_id, "current", (17.0, 11.0, 7.0))
+    session[4]["stage"] = "current-diagnostic-once-only-import"
+    supplied = _supply_product_file(session, fixture)
+    imported = _model(session, (17.0, 11.0, 7.0), fixture.name, CURRENT_RELEASE, "required")
+    if not _current_original_dimensions_match(imported) or supplied.get("sha256") != summary["sha256"]:
+        raise ValueError("NATIVE_DRAW_IMPORT_MISMATCH")
+    checks.append({"name": "diagnostic-normal-import", "supplied_file": supplied, "stl": summary, "dom": imported})
+    _current_position_canvas(session, "draw-canvas", checks)
+    checks.append({"name": "diagnostic-fit-and-canvas-layout", "layout": _layout(session, ("#view", "[data-view=fit]"))})
+    session[4]["stage"] = "current-diagnostic-fit-observation"
+    observation = _observe_fit_draw(session)
+    classification = _classify_draw_observation(observation)
+    checks.append({"name": "diagnostic-same-task-draw", "observation": observation, **classification})
+    if classification["pixel_class"] == "UNKNOWN":
+        raise ValueError("NATIVE_DRAW_OBSERVATION_INSUFFICIENT")
+    if session[4].get("draw_observer_cleanup") != "removed":
+        raise ValueError("NATIVE_DRAW_OBSERVER_CLEANUP")
+    session[4]["stage"] = "current-diagnostic-native-originals"
+    try:
+        canvas_image = _capture(session, output, "draw-canvas", images, "#view")
+        layout = _layout(session, ("#view",))
+        rectangle = _object(layout["controls"][0], "NATIVE_CURRENT_CANVAS_LAYOUT")["rectangle"]
+        expected_height = _number(canvas_image.get("png_width"), "NATIVE_SCREENSHOT_DIMENSIONS") * rectangle[3] / rectangle[2]
+        if abs(_number(canvas_image.get("png_height"), "NATIVE_SCREENSHOT_DIMENSIONS") - expected_height) > 2:
+            raise ValueError("NATIVE_CURRENT_CANVAS_CAPTURE_CLIPPED")
+        checks.append({"name": "diagnostic-complete-native-canvas", "layout": layout, "image": canvas_image})
+        _capture(session, output, "draw-viewport", images)
+    finally:
+        provenance = _diagnostic_capture_provenance(session[4].get("capture_observations_cache", []))
+        session[4]["draw_capture_provenance_cache"] = provenance
+    checks.append({"name": "diagnostic-native-originals", **provenance})
+    if provenance["capture_status"] != "COMPLETED_ORIGINALS":
+        raise ValueError("NATIVE_DRAW_ORIGINALS_INCOMPLETE")
+    final_model = _model(session, (17.0, 11.0, 7.0), fixture.name, CURRENT_RELEASE, "required")
+    if (not _current_original_dimensions_match(final_model)
+            or hashlib.sha256(fixture.read_bytes()).hexdigest() != summary["sha256"]):
+        raise ValueError("NATIVE_DRAW_IMPORT_MISMATCH")
+    checks.append({"name": "diagnostic-unchanged-model", "dom": final_model,
+                   "remaining": "actual-native-image-view-and-full-Safari-download-reopen-controls"})
+
+
+def _phase_contracts() -> dict[str, dict[str, object]]:
+    return {
+        "integration": {"handler": _integration, "previous_phases": (), "result_name": "native-file-controls"},
+        "guest": {"handler": _product, "previous_phases": ("integration",), "result_name": "public-native-guest"},
+        "controls": {"handler": _product, "previous_phases": ("integration", "guest"), "result_name": "public-native-controls"},
+        "current": {"handler": _current_diagnostic, "previous_phases": (),
+                    "result_name": "current-public-native-draw-diagnostic", "image_limit": 2, "edit_policy": "forbidden"},
+        "full-current": {"handler": _current_product, "previous_phases": (),
+                         "result_name": "current-public-native-import-edit-render", "edit_policy": "existing-import-edit-camera"}}
+
+
+def _phase_contract(phase: str) -> dict[str, object]:
+    """Own actual CLI handler, predecessors and result meaning in one pure contract."""
+    contracts = _phase_contracts()
+    if phase not in contracts:
+        raise ValueError("NATIVE_PHASE_UNKNOWN")
+    return contracts[phase]
+
+
+def _argument_parser() -> argparse.ArgumentParser:
+    """Construct the real CLI parser from the same phase contract used at dispatch."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("phase", choices=tuple(_phase_contracts()))
+    parser.add_argument("--output", required=True, type=pathlib.Path)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--deadline-seconds", type=float, default=55.0)
+    return parser
+
+
 def _source_hashes() -> list[dict[str, object]]:
     """Identify every actual source byte used by this run, excluding runtime output."""
     root = pathlib.Path(__file__).resolve().parents[1]
@@ -1016,7 +1424,7 @@ def _source_hashes() -> list[dict[str, object]]:
 
 def _prerequisites(output: pathlib.Path, run_id: str, phase: str, sources: list[dict[str, object]]) -> int:
     """Require same-run guest/controls predecessors; current retains external transport."""
-    previous_phases = () if phase in ("integration", "current") else ("integration",) if phase == "guest" else ("integration", "guest")
+    previous_phases = _phase_contract(phase)["previous_phases"]
     previous_image_bytes = 0
     for previous in previous_phases:
         path = output.parent / previous / "result.json"
@@ -1195,12 +1603,9 @@ def main() -> int:
     Arguments and actual Darwin admission precede browser/process effects. Existing
     output paths are refused so a repeated invocation cannot replay an operation.
     """
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("integration", "guest", "controls", "current"))
-    parser.add_argument("--output", required=True, type=pathlib.Path)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--deadline-seconds", type=float, default=55.0)
+    parser = _argument_parser()
     arguments = parser.parse_args()
+    phase_contract = _phase_contract(arguments.phase)
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", arguments.run_id) is None:
         parser.error("run-id must be 1..64 ASCII letters, digits, underscores or hyphens")
     if not math.isfinite(arguments.deadline_seconds) or not 0 < arguments.deadline_seconds <= 55:
@@ -1246,18 +1651,22 @@ def main() -> int:
                 raise ValueError("NATIVE_SESSION_BUNDLE_VERSION_MISMATCH")
             _command(session, "POST", "/timeouts", {"script": 7000, "pageLoad": 8000, "implicit": 0}, "set-finite-session-timeouts")
             _command(session, "POST", "/window/rect", {"width": 1024, "height": 768}, "set-observed-desktop-viewport")
-            if arguments.phase == "integration":
+            handler = phase_contract["handler"]
+            if handler is _integration:
                 server_port = _free_port()
                 _launch((sys.executable, "-E", "-S", "-B", "-m", "http.server", str(server_port), "--bind", "127.0.0.1",
                          "--directory", str(output / "transport")), "static-server", resources, journal)
-                _integration(session, output, arguments.run_id, "http://127.0.0.1:" + str(server_port), checks, images)
-            elif arguments.phase == "current":
-                _current_product(session, output, arguments.run_id, checks, images)
+                handler(session, output, arguments.run_id, "http://127.0.0.1:" + str(server_port), checks, images)
+            elif handler is _current_diagnostic or handler is _current_product:
+                handler(session, output, arguments.run_id, checks, images)
             else:
-                _product(session, output, arguments.run_id, arguments.phase, checks, images)
+                handler(session, output, arguments.run_id, arguments.phase, checks, images)
+            if "image_limit" in phase_contract and len(images) != phase_contract["image_limit"]:
+                raise ValueError("NATIVE_DRAW_ORIGINALS_INCOMPLETE")
         except Exception as error:
             original_failure = {"code": _failure_code(error), "exception": type(error).__name__}
-            if session is not None and "session" in versions and time.monotonic() < deadline:
+            if (session is not None and "session" in versions and time.monotonic() < deadline
+                    and arguments.phase != "current"):
                 try:
                     original_failure["selected_dom"] = _snapshot(session)
                 except Exception as diagnostic_error:
@@ -1284,6 +1693,8 @@ def main() -> int:
         "observation_cache": observation_cache,
         "limits": ["desktop-not-physical-ios", "actual-image-view-pending", "private-services-not-exercised",
                    "executor-must-retain-provider-identities-and-pre-post-balance"]}
+    if arguments.phase in ("current", "full-current"):
+        result["result_name"] = phase_contract["result_name"]
     _json_file(output / "result.json", result)
     for line in image_lines:
         print(line, flush=True)
