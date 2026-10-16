@@ -53,6 +53,38 @@ def test_product_startup_requires_complete_document_and_both_handlers() -> None:
     assert product_startup_ready(None) is False
 
 
+def test_model_readiness_rejects_the_observed_loading_geometry() -> None:
+    """Reopening an edited STL can retain its old dimensions while loading."""
+    from qa.native_safari import _matches_model
+
+    observed = {"editor": "displayed", "units": "1", "dimensions": "20 × 11 × 7",
+                "filename": "qa-native-guest.stl", "load_progress": "displayed", "load_error": ""}
+    assert _matches_model(observed, (20.0, 11.0, 7.0)) is False
+    settled = {**observed, "load_progress": "absent"}
+    assert _matches_model(settled, (20.0, 11.0, 7.0)) is True
+    assert _matches_model({**settled, "load_error": "Cannot load file"}, (20.0, 11.0, 7.0)) is False
+    for field in ("load_progress", "load_error"):
+        assert _matches_model({key: value for key, value in settled.items() if key != field},
+                              (20.0, 11.0, 7.0)) is False
+    assert observed["load_progress"] == "displayed"
+
+
+def test_loaded_file_readiness_requires_its_exact_source_and_geometry() -> None:
+    """Matching dimensions from the prior source cannot complete file adoption."""
+    from qa.native_safari import _matches_model
+
+    expected_filename = "qa-native-guest-edited.stl"
+    observed = {"editor": "displayed", "units": "1", "dimensions": "20 × 11 × 7",
+                "filename": "qa-native-guest.stl", "load_progress": "absent", "load_error": ""}
+    assert _matches_model(observed, (20.0, 11.0, 7.0), expected_filename) is False
+    adopted = {**observed, "filename": expected_filename}
+    assert _matches_model(adopted, (20.0, 11.0, 7.0), expected_filename) is True
+    for field, value in (("filename", ""), ("dimensions", "17 × 11 × 7"),
+                         ("editor", "absent"), ("units", "25.4"), ("load_progress", "displayed")):
+        assert _matches_model({**adopted, field: value}, (20.0, 11.0, 7.0), expected_filename) is False
+    assert observed["filename"] == "qa-native-guest.stl"
+
+
 def test_json_and_envelope_errors_cannot_become_success() -> None:
     """Malformed bytes, absent values and failed HTTP responses cannot admit a command."""
     for body in (b'not json', b'{"value":null} trailing', b'{"value":"\xff"}',
@@ -136,6 +168,8 @@ def main() -> int:
     tests = (test_response_value_is_preserved_without_coercion,
              test_page_error_text_remains_observation_data,
              test_product_startup_requires_complete_document_and_both_handlers,
+             test_model_readiness_rejects_the_observed_loading_geometry,
+             test_loaded_file_readiness_requires_its_exact_source_and_geometry,
              test_json_and_envelope_errors_cannot_become_success,
              test_remote_error_code_is_retained_without_raw_message,
              test_native_admission_requires_actual_host_and_session_fields,
